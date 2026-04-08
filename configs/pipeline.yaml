@@ -1,0 +1,25 @@
+# ZenML Pipeline Config — Cross-Market Semantic Ranking
+
+data:
+  num_products: 10000
+  queries_per_product: 5
+  use_esci: false
+  esci_max_rows: 50000
+  categories: [Footwear, Electronics, Clothing, Home, Sports, Beauty, Books, Toys, Kitchen, Automotive]
+  brands: [Nike, Sony, Samsung, Apple, Adidas, LG, Dell, Zara, IKEA, Bosch]
+  languages: [en, hi, ar, pl]
+
+model:
+  embedding: intfloat/multilingual-e5-base
+  ranker:
+    objective: lambdarank
+    metric: ndcg
+    num_leaves: 63
+    learning_rate: 0.05
+    num_boost_round: 500
+  retrieval:
+    top_k: 100
+
+pipeline:
+  test_size: 0.2
+  seed: 42

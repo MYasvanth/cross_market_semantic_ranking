@@ -1,0 +1,12 @@
+[
+  {
+    "semantic_sim": 0.85,
+    "bm25_score": 1.2,
+    "jaccard": 0.6,
+    "brand_match": 1.0,
+    "category_match": 1.0,
+    "query_len": 3,
+    "exact_match": 0.0,
+    "cross_lingual": 0.0
+  }
+]

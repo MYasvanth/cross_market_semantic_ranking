@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Artifacts & Models
+artifacts/
+*.onnx
+*.txt.ranker
+ranker.txt
+*.faiss
+*.index
+*.pkl
+*.joblib
+
+# Hydra outputs
+outputs/
+multirun/
+
+# ZenML
+.zen/
+
+# C++ build
+cpp_inference/build/
+*.o
+*.so
+*.a
+*.out
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Env
+.env
+pip-wheel-metadata/
