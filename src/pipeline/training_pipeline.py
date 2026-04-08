@@ -161,12 +161,8 @@ def train_ranker(
     num_boost_round: int = 300,
     test_size: float = 0.2,
     seed: int = 42,
-) -> Tuple[
-    Annotated[LambdaRanker, "ranker"],
-    Annotated[np.ndarray, "X_val"],
-    Annotated[np.ndarray, "y_val"],
-    Annotated[List[int], "group_val"],
-]:
+) -> Annotated[LambdaRanker, "ranker"]:
+
     from omegaconf import OmegaConf
     cfg = OmegaConf.create({
         "ranker":        {"objective": objective, "metric": metric, "num_leaves": num_leaves},
@@ -181,8 +177,44 @@ def train_ranker(
     ranker.save_model("artifacts")
     ranker.export_onnx("artifacts", num_features=X.shape[1])
 
-    log.info("Ranker trained and exported to ONNX")
-    return ranker, X_val, y_val, group_val
+    # Inline evaluation + MLflow logging
+    from src.ranking.evaluator import ablation_study
+    import pandas as pd
+    try:
+        import mlflow
+        import mlflow.lightgbm
+        with mlflow.start_run():
+            mlflow.log_params({
+                'num_boost_round': cfg.num_boost_round,
+                'learning_rate': cfg.learning_rate,
+                'num_leaves': cfg.ranker.num_leaves,
+            })
+            mlflow.lightgbm.log_model(ranker.model, "lambda_ranker")
+    except ImportError:
+        log.warning("MLflow not installed - install with 'pip install mlflow[lightgbm]'")
+    
+    scores = ranker.predict(X_val)
+    feature_columns = [
+        'semantic_sim', 'cross_lingual_sim', 'bm25_score', 'jaccard',
+        'brand_match', 'category_match', 'exact_title_match', 'query_len'
+    ]
+    eval_df = pd.DataFrame(X_val, columns=feature_columns)
+    eval_df['relevance'] = y_val
+    eval_df['ranker_score'] = scores
+    
+    metrics_df = ablation_study(eval_df, group_val)
+    log.info(f"Validation Metrics: {metrics_df.to_dict()}")
+    
+    try:
+        mlflow.log_metrics({
+            f"{row.name}_ndcg": row['ndcg'] for row in metrics_df.itertuples()
+        })
+    except:
+        pass
+    
+    log.info("Ranker trained, evaluated, and logged to MLflow")
+    return ranker
+
 
 
 # ── Step 5: Evaluate ───────────────────────────────────────────────────────
@@ -223,6 +255,6 @@ def ranking_pipeline(
 ):
     train_df                        = ingest_data(num_products, queries_per, use_esci, esci_max_rows, categories, brands)
     product_embs, products          = build_embeddings(train_df, embedding_model_name)
-    X, y, groups                    = build_features(train_df, products, product_embs, embedding_model_name)
-    ranker, X_val, y_val, group_val = train_ranker(X, y, groups, num_boost_round=num_boost_round, num_leaves=num_leaves, learning_rate=learning_rate)
-    evaluate(ranker, X_val, y_val, group_val)
+    X, y, groups = build_features(train_df, products, product_embs, embedding_model_name)
+    ranker = train_ranker(X, y, groups, num_boost_round=num_boost_round, num_leaves=num_leaves, learning_rate=learning_rate)
+
