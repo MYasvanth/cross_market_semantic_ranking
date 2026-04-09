@@ -128,24 +128,27 @@ class FeatureEngineer:
             if is_non_english else semantic_sims
         )
 
-        features = []
-        for i, prod in enumerate(products):
-            title        = titles[i]
-            brand        = prod.get("brand", "").lower()
-            category     = prod.get("category", "").lower()
-            title_tokens = set(title.lower().split())
-            union        = query_tokens | title_tokens
-            jaccard      = len(query_tokens & title_tokens) / len(union) if union else 0.0
+        # Vectorized entity + lexical features
+        brands     = np.array([p.get("brand",    "").lower() for p in products])
+        categories = np.array([p.get("category", "").lower() for p in products])
+        titles_lower = np.array([t.lower() for t in titles])
 
-            features.append([
-                float(semantic_sims[i]),
-                float(cross_lingual_sims[i]),
-                float(bm25_per_title[i]),
-                jaccard,
-                1.0 if brand    and brand    in query_lower else 0.0,
-                1.0 if category and category in query_lower else 0.0,
-                1.0 if query_lower in title.lower() else 0.0,
-                query_len,
-            ])
+        brand_match    = np.array([1.0 if b and b in query_lower else 0.0 for b in brands],     dtype=np.float32)
+        category_match = np.array([1.0 if c and c in query_lower else 0.0 for c in categories], dtype=np.float32)
+        exact_match    = np.array([1.0 if query_lower in t else 0.0 for t in titles_lower],      dtype=np.float32)
 
-        return np.array(features, dtype=np.float32)
+        title_token_sets = [set(t.split()) for t in titles_lower]
+        unions   = np.array([len(query_tokens | ts) for ts in title_token_sets], dtype=np.float32)
+        intersect = np.array([len(query_tokens & ts) for ts in title_token_sets], dtype=np.float32)
+        jaccard  = np.where(unions > 0, intersect / unions, 0.0).astype(np.float32)
+
+        return np.column_stack([
+            semantic_sims.astype(np.float32),
+            cross_lingual_sims.astype(np.float32),
+            bm25_per_title.astype(np.float32),
+            jaccard,
+            brand_match,
+            category_match,
+            exact_match,
+            np.full(len(products), query_len, dtype=np.float32),
+        ])
