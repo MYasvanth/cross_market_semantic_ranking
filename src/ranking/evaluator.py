@@ -5,6 +5,10 @@ import pandas as pd
 import numpy as np
 
 
+import logging
+
+log = logging.getLogger(__name__)
+
 def compute_ndcg(y_true: np.ndarray, y_score: np.ndarray, k=10) -> float:
     return ndcg_score([y_true], [y_score], k=k)
 
@@ -18,22 +22,25 @@ def compute_mrr(y_true: np.ndarray, y_score: np.ndarray) -> float:
 def _mean_metrics(df: pd.DataFrame, score_col: str, groups: List[int]):
     """Compute mean NDCG@10 and MRR across query groups."""
     ndcgs, mrrs = [], []
-    y_true_all   = df["relevance"].values
-    y_score_all  = df[score_col].values
+    y_true_all  = df["relevance"].values
+    y_score_all = df[score_col].values
+
+    if sum(groups) != len(df):
+        log.warning(f"Group mismatch in evaluator: sum(groups)={sum(groups)}, len(df)={len(df)}")
+        return {"ndcg": 0.0, "mrr": 0.0}
 
     start = 0
     for gsize in groups:
-        end = start + gsize
-        y_true  = y_true_all[start : end]
-        y_score = y_score_all[start : end]
-        start = end
-        
-        if y_true.sum() == 0:   # skip queries with no relevant docs
+        end     = start + gsize
+        y_true  = y_true_all[start:end]
+        y_score = y_score_all[start:end]
+        start   = end
+        if y_true.sum() == 0:
             continue
         ndcgs.append(compute_ndcg(y_true, y_score))
         mrrs.append(compute_mrr(y_true, y_score))
 
-    return {"ndcg": np.mean(ndcgs) if ndcgs else 0.0, "mrr": np.mean(mrrs) if mrrs else 0.0}
+    return {"ndcg": float(np.mean(ndcgs)) if ndcgs else 0.0, "mrr": float(np.mean(mrrs)) if mrrs else 0.0}
 
 
 def ablation_study(df: pd.DataFrame, groups: List[int]) -> pd.DataFrame:
