@@ -29,13 +29,22 @@ class EmbeddingModel:
         self.model = SentenceTransformer(model_name)
         self.device = device
         
+    _MAX_TEXT_LEN = 512
+
     def encode(self, texts: list[str], batch_size: int = 32, normalize: bool = True) -> np.ndarray:
-        """Encode texts to embeddings."""
+        """Encode texts to embeddings with input validation."""
+        if not texts:
+            raise ValueError("texts must be a non-empty list")
+        sanitized = []
+        for i, t in enumerate(texts):
+            if not isinstance(t, str):
+                raise TypeError(f"texts[{i}] must be str, got {type(t).__name__}")
+            sanitized.append(t[:self._MAX_TEXT_LEN])
         embeddings = self.model.encode(
-            texts, 
-            batch_size=batch_size, 
+            sanitized,
+            batch_size=batch_size,
             show_progress_bar=True,
-            normalize_embeddings=normalize
+            normalize_embeddings=normalize,
         )
         return embeddings
     
