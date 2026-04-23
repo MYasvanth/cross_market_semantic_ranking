@@ -2,8 +2,6 @@ import pandas as pd
 import numpy as np
 from typing import List, Dict, Generator
 from datasets import load_dataset
-from src.embeddings.embedding_model import EmbeddingModel
-from sklearn.metrics.pairwise import cosine_similarity
 import logging
 
 log = logging.getLogger(__name__)
@@ -12,7 +10,11 @@ log = logging.getLogger(__name__)
 ESCI_DATASET_ID = "tasksource/esci"
 
 # ESCI label -> relevance score (0-3)
-ESCI_LABEL_MAP = {'E': 3, 'S': 2, 'C': 1, 'I': 0}
+# tasksource/esci uses full strings: 'Exact', 'Substitute', 'Complement', 'Irrelevant'
+ESCI_LABEL_MAP = {
+    'Exact': 3, 'Substitute': 2, 'Complement': 1, 'Irrelevant': 0,
+    'E': 3,     'S': 2,         'C': 1,           'I': 0,          # legacy short-form
+}
 
 
 class DataGenerator:
@@ -28,7 +30,6 @@ class DataGenerator:
         self.num_products  = config.get('num_products', 1_000)
         self.queries_per   = config.get('queries_per_product', 5)
         self.esci_max_rows = config.get('esci_max_rows', 50_000)
-        self.embedding_model = EmbeddingModel(config.get('model_name', 'intfloat/multilingual-e5-base'))
 
     # ── Primary: Amazon ESCI ───────────────────────────────────────────────
 
@@ -42,18 +43,25 @@ class DataGenerator:
 
         batch = []
         total = 0
+        first_row_logged = False
         for row in dataset:
+            if not first_row_logged:
+                log.info(f"ESCI sample row keys: {list(row.keys())}")
+                log.info(f"ESCI sample esci_label: {row.get('esci_label')} | label: {row.get('label')}")
+                first_row_logged = True
             if max_rows and total >= max_rows:
                 break
+            raw_label = row.get('esci_label')
+            relevance = ESCI_LABEL_MAP.get(raw_label, 0)
             batch.append({
-                'qid':           row['query_id'],
-                'pid':           row['product_id'],
-                'query':         row['query'],
-                'query_lang':    row.get('query_locale', 'en'),
-                'product_title': row['product_title'],
-                'brand':         row.get('brand', ''),
-                'category':      row.get('product_type', row.get('product_locale', '')),
-                'relevance':     ESCI_LABEL_MAP.get(row['esci_label'], 0)
+                'qid':           str(row['query_id']),
+                'pid':           str(row['product_id']),
+                'query':         row.get('query') or '',
+                'query_lang':    row.get('product_locale') or 'en',
+                'product_title': row.get('product_title') or '',
+                'brand':         row.get('product_brand') or '',
+                'category':      row.get('product_locale') or '',
+                'relevance':     relevance
             })
             total += 1
             if len(batch) >= 10_000:
@@ -71,43 +79,43 @@ class DataGenerator:
         self, num_products: int = 1_000, queries_per: int = 5
     ) -> Generator[Dict, None, None]:
         """
-        Synthetic data for cold-start markets not covered by ESCI.
-        Batch encodes all titles + queries — no per-row encode calls.
+        Synthetic data for cold-start markets.
+        Relevance is rule-based (text overlap) — no embedding used to avoid leakage.
         """
         products = self._generate_products(num_products)
 
-        # Batch encode all product titles once
-        all_prod_embs = self.embedding_model.encode(
-            products["title_en"].tolist()
-        )
-
-        # Pre-generate all queries then batch encode
-        all_queries, all_meta = [], []
-        for i, (_, prod) in enumerate(products.iterrows()):
+        for _, prod in products.iterrows():
             for q in self._generate_queries(prod, queries_per):
-                all_queries.append(q['text'])
-                all_meta.append((i, prod, q))
+                relevance = self._rule_based_relevance(q['text'], prod)
+                yield {
+                    'qid':                 f"synth_q{prod['product_id']}_{q['text'][:20]}",
+                    'pid':                 f"synth_p{prod['product_id']}",
+                    'query':               q['text'],
+                    'query_lang':          q['lang'],
+                    'product_title':       prod['title_en'],
+                    'product_title_local': prod['title_local'],
+                    'brand':               prod['brand'],
+                    'category':            prod['category'],
+                    'relevance':           relevance
+                }
 
-        all_query_embs = self.embedding_model.encode(
-            all_queries
-        )
-
-        for idx, (prod_idx, prod, q) in enumerate(all_meta):
-            sim = cosine_similarity([all_query_embs[idx]], [all_prod_embs[prod_idx]])[0][0]
-            if q['lang'] != 'en':
-                sim *= 0.9
-            relevance = 0 if 'irrelevant' in q['text'] else min(4, max(0, int(sim * 4 + np.random.normal(0, 0.2))))
-            yield {
-                'qid':                 f"synth_q{prod['product_id']}_{idx}",
-                'pid':                 f"synth_p{prod['product_id']}",
-                'query':               q['text'],
-                'query_lang':          q['lang'],
-                'product_title':       prod['title_en'],
-                'product_title_local': prod['title_local'],
-                'brand':               prod['brand'],
-                'category':            prod['category'],
-                'relevance':           relevance
-            }
+    @staticmethod
+    def _rule_based_relevance(query: str, prod: pd.Series) -> int:
+        """Assign relevance purely from text rules — no embeddings, no leakage."""
+        if 'irrelevant' in query.lower():
+            return 0
+        q = query.lower()
+        brand    = prod['brand'].lower()
+        category = prod['category'].lower()
+        brand_match    = brand in q
+        category_match = category in q
+        if brand_match and category_match:
+            return 3   # Exact
+        if brand_match or category_match:
+            return 2   # Substitute
+        if any(w in q for w in ['best', 'cheap', 'buy']):
+            return 1   # Complement
+        return 0       # Irrelevant
 
     # ── Entry Point: ESCI primary + Synthetic secondary ───────────────────
 
@@ -121,17 +129,16 @@ class DataGenerator:
             ESCI stream (10k chunks)  -> if use_esci=True
         """
         # Secondary: synthetic cold-start always runs first
-        log.info(f"Generating {self.num_products} synthetic cold-start products")
-        
-        # Stream synthetic data in 10k chunks
-        batch = []
-        for row in self.generate_synthetic_stream(self.num_products, self.queries_per):
-            batch.append(row)
-            if len(batch) >= 10_000:
+        if self.num_products > 0:
+            log.info(f"Generating {self.num_products} synthetic cold-start products")
+            batch = []
+            for row in self.generate_synthetic_stream(self.num_products, self.queries_per):
+                batch.append(row)
+                if len(batch) >= 10_000:
+                    yield pd.DataFrame(batch)
+                    batch = []
+            if batch:
                 yield pd.DataFrame(batch)
-                batch = []
-        if batch:
-            yield pd.DataFrame(batch)
         
         # Primary: ESCI streamed on top
         if use_esci:
