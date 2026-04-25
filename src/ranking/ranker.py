@@ -54,13 +54,15 @@ class LambdaRanker:
                 "metric":                  self.cfg.metric,
                 "num_leaves":              self.cfg.num_leaves,
                 "learning_rate":           self.cfg.learning_rate,
-                "min_data_in_leaf":        10,
+                "min_data_in_leaf":        5,
                 "min_sum_hessian_in_leaf": 0,
                 "label_gain":              label_gain,
                 "feature_fraction":        0.8,
                 "bagging_fraction":        0.8,
                 "bagging_freq":            1,
                 "lambda_l2":               0.1,
+                "pos_bagging_fraction":    1.0,
+                "neg_bagging_fraction":    0.3,
                 "verbose":                 -1,
             },
             train_set,
@@ -73,7 +75,9 @@ class LambdaRanker:
         from src.ranking.evaluator import ablation_study
         train_eval_df = pd.DataFrame(X_train, columns=[
             'semantic_sim', 'cross_lingual_sim', 'bm25_score', 'jaccard',
-            'brand_match', 'category_match', 'exact_title_match', 'query_len'
+            'brand_match', 'category_match', 'exact_title_match', 'query_len',
+            'intent_brand_weight', 'intent_sku_weight', 'intent_generic_weight',
+            'semantic_channel', 'lexical_channel', 'constraint_channel',
         ])
         train_eval_df['relevance'] = y_train
         train_eval_df['ranker_score'] = train_scores
@@ -85,6 +89,71 @@ class LambdaRanker:
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict ranking scores."""
         return self.model.predict(X)
+
+    def post_process(
+        self,
+        scores: np.ndarray,
+        X: np.ndarray,
+        query: str,
+        products: list,
+        brand_col: int = 4,
+        category_col: int = 5,
+    ) -> np.ndarray:
+        """
+        Deterministic guardrails applied after model scoring.
+
+        Rules:
+        1. Brand Guardrail: If query contains a known brand, demote non-matching
+           products unless their score is already very high (>0.9).
+        2. Category Hierarchy Guardrail: Prevent accessories from outranking
+           primary devices when both appear in the top-10.
+        """
+        from src.data.normalizer import normalize_entity, normalize_query, KNOWN_BRANDS
+        scores = scores.copy()
+        norm_query = normalize_query(query)
+
+        # ── Rule 1: Brand Guardrail ──────────────────────────────────
+        query_brand = None
+        for b in KNOWN_BRANDS:
+            if b in norm_query:
+                query_brand = b
+                break
+
+        if query_brand is not None:
+            non_brand_mask = X[:, brand_col] == 0.0
+            # Demote non-brand matches unless score > 0.9 (keep strong semantic hits)
+            demote_mask = non_brand_mask & (scores < 0.9)
+            scores[demote_mask] *= 0.1
+
+        # ── Rule 2: Category Hierarchy Guardrail ─────────────────────
+        primary_categories   = {"laptops", "phones", "electronics", "shoes", "clothing"}
+        accessory_categories = {"accessories", "chargers", "cases", "cables", "covers"}
+
+        # Infer if query targets a primary category
+        query_targets_primary = any(cat in norm_query for cat in primary_categories)
+
+        if query_targets_primary:
+            top10_idx = np.argsort(scores)[-10:]
+            top10_products = [products[i] for i in top10_idx]
+            top10_categories = [
+                normalize_entity((p.get("category") or "").lower(), 'category')
+                for p in top10_products
+            ]
+            primary_in_top10 = any(c in primary_categories for c in top10_categories)
+            if primary_in_top10:
+                # Find lowest primary score in top-10
+                primary_scores = [
+                    scores[top10_idx[i]]
+                    for i, c in enumerate(top10_categories)
+                    if c in primary_categories
+                ]
+                min_primary_score = min(primary_scores)
+                # Cap accessory scores below the weakest primary
+                for i, idx in enumerate(top10_idx):
+                    if top10_categories[i] in accessory_categories:
+                        scores[idx] = min(scores[idx], min_primary_score - 0.01)
+
+        return scores
     
     def _safe_path(self, base: str, filename: str) -> Path:
         """Resolve path and guard against traversal outside base dir."""
