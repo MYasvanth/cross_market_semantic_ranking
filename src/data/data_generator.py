@@ -22,6 +22,12 @@ class DataGenerator:
     Data loading strategy:
       Primary   -> Amazon ESCI (real queries + products, streamed)
       Secondary -> Synthetic cold-start data (fills new market gaps)
+
+    Augmentation support (optional):
+      - LLM-generated realistic titles & 50+ diverse queries per product
+      - Hard negative injection for precision@1 training
+      - Attribute noise to force semantic channel reliance
+      - Synonym injection for cross-lingual robustness
     """
 
     def __init__(self, config: Dict):
@@ -30,6 +36,25 @@ class DataGenerator:
         self.num_products  = config.get('num_products', 1_000)
         self.queries_per   = config.get('queries_per_product', 5)
         self.esci_max_rows = config.get('esci_max_rows', 50_000)
+
+        # Augmentation config
+        self.use_augmentation = config.get('use_augmentation', False)
+        self.augmentor = None
+        if self.use_augmentation:
+            from src.data.synthetic_augmentor import SyntheticAugmentor
+            self.augmentor = SyntheticAugmentor(
+                api_key=config.get('grok_api_key'),
+                api_endpoint=config.get('grok_api_endpoint'),
+                cache_path=config.get('augmentation_cache_path', 'artifacts/synthetic_cache.pkl'),
+                use_llm=config.get('use_llm', False),
+                queries_per_product=config.get('queries_per_product', 50),
+                hard_negative_ratio=config.get('hard_negative_ratio', 0.15),
+                attribute_noise_ratio=config.get('attribute_noise_ratio', 0.20),
+                synonym_injection_ratio=config.get('synonym_injection_ratio', 0.30),
+                llm_model_name=config.get('llm_model_name', 'grok-2-latest'),
+                seed=config.get('seed', 42),
+            )
+            log.info("Synthetic augmentation enabled via SyntheticAugmentor")
 
     # ── Primary: Amazon ESCI ───────────────────────────────────────────────
 
@@ -81,7 +106,64 @@ class DataGenerator:
         """
         Synthetic data for cold-start markets.
         Relevance is rule-based (text overlap) — no embedding used to avoid leakage.
+
+        If augmentation is enabled, uses SyntheticAugmentor for:
+          - Realistic product titles with attributes
+          - 50+ diverse queries per product (generic, brand, SKU, descriptive, multilingual)
+          - Hard negative injection (confusing near-misses)
+          - Attribute noise and synonym injection
         """
+        if self.augmentor:
+            yield from self._generate_augmented_stream(num_products, queries_per)
+        else:
+            yield from self._generate_legacy_stream(num_products, queries_per)
+
+    def _generate_augmented_stream(self, num_products: int, queries_per: int) -> Generator[Dict, None, None]:
+        """Augmented synthetic stream with LLM/fallback-generated realistic data."""
+        products = self.augmentor.generate_catalog(
+            n=num_products,
+            categories=self.categories,
+            brands=self.brands,
+        )
+
+        for prod in products:
+            # Positive queries
+            queries = self.augmentor.generate_queries(prod, n=queries_per)
+            for q in queries:
+                # Use synonym-aware relevance assignment from augmentor
+                relevance = self.augmentor.assign_relevance(q['text'], prod)
+                yield {
+                    'qid':                 f"synth_q{prod.product_id}_{hash(q['text']) & 0xFFFFFF:06x}",
+                    'pid':                 f"synth_p{prod.product_id}",
+                    'query':               q['text'],
+                    'query_lang':          q.get('lang', 'en'),
+                    'product_title':       prod.title_en,
+                    'product_title_local': prod.title_local.get(q.get('lang', 'en'), prod.title_local.get('en', '')),
+                    'brand':               prod.brand,
+                    'category':            prod.category,
+                    'relevance':           relevance,
+                    'intent':              q.get('intent', 'generic'),
+                }
+
+            # Hard negatives (confusing near-misses)
+            for q in queries[:max(1, int(queries_per * 0.3))]:
+                hard_negs = self.augmentor.generate_hard_negatives(prod, q)
+                for neg in hard_negs:
+                    yield {
+                        'qid':                 f"synth_q{prod.product_id}_hn_{hash(neg['text']) & 0xFFFFFF:06x}",
+                        'pid':                 f"synth_p{prod.product_id}",
+                        'query':               neg['text'],
+                        'query_lang':          neg.get('lang', 'en'),
+                        'product_title':       prod.title_en,
+                        'product_title_local': prod.title_local.get(neg.get('lang', 'en'), ''),
+                        'brand':               prod.brand,
+                        'category':            prod.category,
+                        'relevance':           0,  # Hard negatives are explicitly irrelevant
+                        'intent':              neg.get('intent', 'hard_negative'),
+                    }
+
+    def _generate_legacy_stream(self, num_products: int, queries_per: int) -> Generator[Dict, None, None]:
+        """Original static template-based synthetic stream (fallback)."""
         products = self._generate_products(num_products)
 
         for _, prod in products.iterrows():
@@ -100,20 +182,30 @@ class DataGenerator:
                 }
 
     @staticmethod
-    def _rule_based_relevance(query: str, prod: pd.Series) -> int:
+    def _rule_based_relevance(query: str, prod) -> int:
         """Assign relevance purely from text rules — no embeddings, no leakage."""
-        if 'irrelevant' in query.lower():
+        from src.data.normalizer import normalize_entity, normalize_query
+        if 'irrelevant' in query.lower() or 'hard_negative' in query.lower():
             return 0
-        q = query.lower()
-        brand    = prod['brand'].lower()
-        category = prod['category'].lower()
+        q = normalize_query(query)
+
+        # Handle both AugmentedProduct (dataclass) and pd.Series (dict-like)
+        if hasattr(prod, 'brand'):
+            # AugmentedProduct or object with attributes
+            brand = normalize_entity(getattr(prod, 'brand', ''), 'brand')
+            category = normalize_entity(getattr(prod, 'category', ''), 'category')
+        else:
+            # pd.Series or dict
+            brand = normalize_entity(prod.get('brand', ''), 'brand')
+            category = normalize_entity(prod.get('category', ''), 'category')
+
         brand_match    = brand in q
         category_match = category in q
         if brand_match and category_match:
             return 3   # Exact
         if brand_match or category_match:
             return 2   # Substitute
-        if any(w in q for w in ['best', 'cheap', 'buy']):
+        if any(w in q for w in ['best', 'cheap', 'buy', 'top', 'affordable']):
             return 1   # Complement
         return 0       # Irrelevant
 
@@ -131,6 +223,10 @@ class DataGenerator:
         # Secondary: synthetic cold-start always runs first
         if self.num_products > 0:
             log.info(f"Generating {self.num_products} synthetic cold-start products")
+            if self.augmentor:
+                log.info(f"Augmentation active: {self.augmentor.queries_per_product} queries/product, "
+                         f"hard_neg_ratio={self.augmentor.hard_negative_ratio}, "
+                         f"noise_ratio={self.augmentor.attribute_noise_ratio}")
             batch = []
             for row in self.generate_synthetic_stream(self.num_products, self.queries_per):
                 batch.append(row)
@@ -147,7 +243,7 @@ class DataGenerator:
             except Exception as e:
                 log.warning(f"ESCI stream failed ({e}) — using synthetic only")
 
-    # ── Helpers ───────────────────────────────────────────────────────────
+    # ── Legacy Helpers ────────────────────────────────────────────────────
 
     def _generate_products(self, n: int) -> pd.DataFrame:
         np.random.seed(42)
