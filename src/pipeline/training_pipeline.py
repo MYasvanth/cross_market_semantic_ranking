@@ -20,17 +20,28 @@ log = logging.getLogger(__name__)
 
 # ── Step 1: Data Ingestion ─────────────────────────────────────────────────
 
-@step(enable_cache=False)
+@step(enable_cache=True)
 def ingest_data(
     cfg: PipelineConfig,
 ) -> Annotated[pd.DataFrame, "train_df"]:
     config = {
-        "num_products":        cfg.data.num_products,
-        "queries_per_product": cfg.data.queries_per,
-        "use_esci":            cfg.data.use_esci,
-        "esci_max_rows":       cfg.data.esci_max_rows,
-        "categories":          cfg.data.categories,
-        "brands":              cfg.data.brands,
+        "num_products":            cfg.data.num_products,
+        "queries_per_product":     cfg.data.queries_per,
+        "use_esci":                cfg.data.use_esci,
+        "esci_max_rows":           cfg.data.esci_max_rows,
+        "categories":              cfg.data.categories,
+        "brands":                  cfg.data.brands,
+        # Augmentation config
+        "use_augmentation":        cfg.data.use_augmentation,
+        "use_llm":                 cfg.data.use_llm,
+        "grok_api_key":            cfg.data.grok_api_key,
+        "grok_api_endpoint":       cfg.data.grok_api_endpoint,
+        "llm_model_name":          cfg.data.llm_model_name,
+        "augmentation_cache_path": cfg.data.augmentation_cache_path,
+        "hard_negative_ratio":     cfg.data.hard_negative_ratio,
+        "attribute_noise_ratio":   cfg.data.attribute_noise_ratio,
+        "synonym_injection_ratio": cfg.data.synonym_injection_ratio,
+        "seed":                    cfg.data.seed,
     }
     generator = DataGenerator(config)
     chunks = []
@@ -59,7 +70,7 @@ def ingest_data(
 
 # ── Step 2: Build Embeddings + Vector Store ────────────────────────────────
 
-@step(enable_cache=False)
+@step(enable_cache=True)
 def build_embeddings(
     train_df: pd.DataFrame,
     cfg: PipelineConfig,
@@ -74,14 +85,26 @@ def build_embeddings(
         .rename(columns={"product_title": "title"})
         .reset_index(drop=True)
     )
+    log.info(f"Catalog size: {len(products)} products")
     product_embs = embed_model.encode(products["title"].tolist())
     log.info(f"Encoded {len(products)} products -> shape {product_embs.shape}")
+
+    # Save for predict.py
+    import pickle
+    from pathlib import Path
+    artifacts = Path("artifacts")
+    artifacts.mkdir(exist_ok=True)
+    with open(artifacts / "catalog.pkl", "wb") as f:
+        pickle.dump(products, f)
+    np.save(artifacts / "embeddings.npy", product_embs)
+    log.info(f"Saved catalog.pkl and embeddings.npy to artifacts/")
+
     return product_embs, products
 
 
 # ── Step 3: Feature Engineering ────────────────────────────────────────────
 
-@step(enable_cache=False)
+@step(enable_cache=True)
 def build_features(
     train_df: pd.DataFrame,
     products: pd.DataFrame,
@@ -98,6 +121,7 @@ def build_features(
 
     bm25_docs = products["title"].str.split().tolist()
     feat_eng  = FeatureEngineer(embed_model, bm25_docs)
+    feat_eng.precompute_catalog(products)  # pre-normalize once for 50k+ queries
 
     # Batch encode all unique queries
     unique_queries   = train_df[["qid", "query"]].drop_duplicates("qid")
@@ -114,18 +138,47 @@ def build_features(
         non_en_translated = [_translate_query(q_texts[i]) for i in non_en_indices]
         all_translated_embs[non_en_indices] = embed_model.encode(non_en_translated)
 
-    _, all_pids = vector_store.search(all_query_embs, k=100)
-    all_scores, all_pids = vector_store.search(all_query_embs, k=100)
+    # ── Stage 1 Retrieval: Hybrid or Pure Semantic ───────────────────────
+    retrieval_k = cfg.data.retrieval_k
+    use_hybrid = cfg.data.use_hybrid_retrieval
 
-    query_lookup = {
-        row["qid"]: {
+    if use_hybrid:
+        from src.retrieval.retriever import HybridRetriever
+        retriever = HybridRetriever(
+            embed_model, vector_store, bm25_docs,
+            rrf_k=cfg.data.rrf_k,
+            semantic_weight=cfg.data.semantic_weight,
+            bm25_weight=cfg.data.bm25_weight,
+        )
+        log.info(f"Using HybridRetriever (k={retrieval_k}, rrf_k={cfg.data.rrf_k})")
+    else:
+        from src.retrieval.retriever import SemanticRetriever
+        retriever = SemanticRetriever(embed_model, vector_store)
+        log.info(f"Using SemanticRetriever (k={retrieval_k})")
+
+    # Pre-compute retrieval results for all unique queries
+    query_lookup = {}
+    for i, row in enumerate(unique_queries.to_dict("records")):
+        qid = row["qid"]
+        query_text = row["query"]
+
+        if use_hybrid:
+            # HybridRetriever returns (doc_idx, fused_score) sorted by score desc
+            hybrid_results = retriever.retrieve(query_text, top_k=retrieval_k)
+            pids = [r[0] for r in hybrid_results]
+            scores = [r[1] for r in hybrid_results]
+        else:
+            # Pure semantic: FAISS returns L2 distances
+            scores_arr, pids_arr = vector_store.search(all_query_embs[i:i+1], k=retrieval_k)
+            pids = pids_arr[0].tolist()
+            scores = scores_arr[0].tolist()
+
+        query_lookup[qid] = {
             "emb":            all_query_embs[i].reshape(1, -1),
             "translated_emb": all_translated_embs[i].reshape(1, -1),
-            "pids":           all_pids[i].tolist(),
-            "scores":         all_scores[i].tolist(),
+            "pids":           pids,
+            "scores":         scores,
         }
-        for i, row in enumerate(unique_queries.to_dict("records"))
-    }
 
     pid_to_idx = {pid: idx for idx, pid in enumerate(products["pid"])}
 
@@ -151,20 +204,71 @@ def build_features(
         lookup         = query_lookup[qid]
         q_emb          = lookup["emb"]
         t_emb          = lookup["translated_emb"]
-        faiss_pids_int = lookup["pids"]
-        faiss_scores   = lookup["scores"]
+        retrieved_pids_int = lookup["pids"]
+        retrieved_scores   = lookup["scores"]
 
         # Labeled pids that exist in catalog
         labeled_pids   = [p for p in qgroup["pid"].unique() if p in pid_to_idx]
-        # FAISS augmentation — HNSW returns L2 distances (lower=better);
-        # distance < 1.0 on unit vectors ≈ cosine_sim > 0.5 — filters noisy irrelevant candidates
-        faiss_pids_str = [
-            products.iloc[i]["pid"]
-            for i, s in zip(faiss_pids_int, faiss_scores) if s < 1.0
-        ]
-        extra_pids     = [p for p in faiss_pids_str if p not in set(labeled_pids)]
-        candidate_pids = (labeled_pids + extra_pids)[:100]
-        pids_int       = [pid_to_idx[p] for p in candidate_pids]
+        labeled_set    = set(labeled_pids)
+
+        # Filter retrieved candidates
+        if use_hybrid:
+            # Hybrid: fused scores — higher is better. Use percentile threshold.
+            if len(retrieved_scores) > 0:
+                score_threshold = np.percentile(retrieved_scores, 25)  # Keep top 75%
+            else:
+                score_threshold = 0.0
+            retrieved_candidates = [
+                (products.iloc[i]["pid"], s)
+                for i, s in zip(retrieved_pids_int, retrieved_scores)
+                if s >= score_threshold and i < len(products)
+            ]
+        else:
+            # Pure semantic: FAISS returns L2 distances
+            retrieved_candidates = [
+                (products.iloc[i]["pid"], s)
+                for i, s in zip(retrieved_pids_int, retrieved_scores) if s < 1.0
+            ]
+
+        # ── Hard-Negative Mining ──────────────────────────────────────
+        # Select "near misses": high retrieval score but brand does NOT match
+        from src.data.normalizer import normalize_entity, normalize_query
+        norm_query = normalize_query(query)
+        hard_neg_pids = []
+        random_extra  = []
+
+        if use_hybrid:
+            # Hybrid: top-scoring non-brand matches are hard negatives
+            for pid, score in retrieved_candidates:
+                if pid in labeled_set:
+                    continue
+                prod = products.iloc[pid_to_idx[pid]]
+                prod_brand = normalize_entity((prod.get("brand") or "").lower(), 'brand')
+                is_brand_match = prod_brand and prod_brand in norm_query
+                # Top 30% scores that don't brand-match = hard negatives
+                score_percentile = score / max(retrieved_scores[0], 1e-6) if retrieved_scores else 0
+                if score_percentile > 0.7 and not is_brand_match:
+                    hard_neg_pids.append(pid)
+                else:
+                    random_extra.append(pid)
+        else:
+            # Pure semantic: L2 < 0.8 ≈ cos > 0.68 but no brand match
+            for pid, dist in retrieved_candidates:
+                if pid in labeled_set:
+                    continue
+                prod = products.iloc[pid_to_idx[pid]]
+                prod_brand = normalize_entity((prod.get("brand") or "").lower(), 'brand')
+                is_brand_match = prod_brand and prod_brand in norm_query
+                if dist < 0.8 and not is_brand_match:
+                    hard_neg_pids.append(pid)
+                else:
+                    random_extra.append(pid)
+
+        # Compose candidate list: labeled + hard-negs (priority) + random filler
+        candidate_pids = (labeled_pids + hard_neg_pids[:10] + random_extra)[:retrieval_k]
+        pids_int       = [pid_to_idx[p] for p in candidate_pids if p in pid_to_idx]
+        if hard_neg_pids:
+            log.debug(f"Query '{query[:40]}': {len(hard_neg_pids)} hard negatives selected")
 
         if len(pids_int) < 2:
             skipped += 1
@@ -180,7 +284,7 @@ def build_features(
         )
 
         labeled_relevance = qgroup.groupby("pid")["relevance"].max()
-        y_group = labeled_relevance.reindex(candidate_pids, fill_value=0).values
+        y_group = labeled_relevance.reindex(candidate_pids, fill_value=0).values[:len(pids_int)]
 
         if labeled_relevance.max() == 0:
             skipped += 1
@@ -198,7 +302,7 @@ def build_features(
 
 # ── Step 4: Train Ranker ───────────────────────────────────────────────────
 
-@step(output_materializers={"ranker": LambdaRankerMaterializer}, enable_cache=False)
+@step(output_materializers={"ranker": LambdaRankerMaterializer}, enable_cache=True)
 def train_ranker(
     X: np.ndarray,
     y: np.ndarray,
@@ -214,14 +318,18 @@ def train_ranker(
     from src.ranking.evaluator import ablation_study
     import pandas as pd
 
-    scores = ranker.predict(X_val)
+    raw_scores = ranker.predict(X_val)
     feature_columns = [
         'semantic_sim', 'cross_lingual_sim', 'bm25_score', 'jaccard',
-        'brand_match', 'category_match', 'exact_title_match', 'query_len'
+        'brand_match', 'category_match', 'exact_title_match', 'query_len',
+        'intent_brand_weight', 'intent_sku_weight', 'intent_generic_weight',
+        'semantic_channel', 'lexical_channel', 'constraint_channel',
     ]
     eval_df = pd.DataFrame(X_val, columns=feature_columns)
     eval_df['relevance'] = y_val
-    eval_df['ranker_score'] = scores
+    # Note: post_process needs per-query products; for val eval we use raw scores
+    # Guardrails are applied at inference time in the serving layer.
+    eval_df['ranker_score'] = raw_scores
 
     # Log feature statistics for debugging
     log.info(f"Feature means: {X_val.mean(axis=0)}")
@@ -261,6 +369,7 @@ def train_ranker(
 
 
 
+
 # ── Step 5: Evaluate ───────────────────────────────────────────────────────
 
 @step(enable_cache=False)
@@ -270,13 +379,15 @@ def evaluate(
     y_val: np.ndarray,
     group_val: List[int],
 ) -> Annotated[pd.DataFrame, "eval_results"]:
-    scores = ranker.predict(X_val)
+    raw_scores = ranker.predict(X_val)
     eval_df = pd.DataFrame(X_val, columns=[
         "semantic_sim", "cross_lingual_sim", "bm25_score", "jaccard",
-        "brand_match", "category_match", "exact_title_match", "query_len"
+        "brand_match", "category_match", "exact_title_match", "query_len",
+        "intent_brand_weight", "intent_sku_weight", "intent_generic_weight",
+        "semantic_channel", "lexical_channel", "constraint_channel",
     ])
     eval_df["relevance"]    = y_val
-    eval_df["ranker_score"] = scores
+    eval_df["ranker_score"] = raw_scores
     results = ablation_study(eval_df, group_val)
     print(results)
     return results
@@ -290,4 +401,3 @@ def ranking_pipeline(cfg: PipelineConfig = PipelineConfig()):
     product_embs, products = build_embeddings(train_df, cfg)
     X, y, groups           = build_features(train_df, products, product_embs, cfg)
     ranker                 = train_ranker(X, y, groups, cfg)
-
