@@ -14,6 +14,8 @@ class EmbeddingModel:
     MODEL_NAME = "intfloat/multilingual-e5-base"
     
     def __new__(cls, model_name: Optional[str] = None, device: str = "cpu"):
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         model_name = model_name or cls.MODEL_NAME
         cache_key = (model_name, device)
         if cache_key not in _MODEL_CACHE:
@@ -31,7 +33,7 @@ class EmbeddingModel:
         
     _MAX_TEXT_LEN = 512
 
-    def encode(self, texts: list[str], batch_size: int = 32, normalize: bool = True) -> np.ndarray:
+    def encode(self, texts: list[str], batch_size: int = 64, normalize: bool = True) -> np.ndarray:
         """Encode texts to embeddings with input validation."""
         if not texts:
             raise ValueError("texts must be a non-empty list")
@@ -43,7 +45,7 @@ class EmbeddingModel:
         embeddings = self.model.encode(
             sanitized,
             batch_size=batch_size,
-            show_progress_bar=True,
+            show_progress_bar=False,
             normalize_embeddings=normalize,
         )
         return embeddings
