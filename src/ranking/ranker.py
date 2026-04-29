@@ -54,21 +54,21 @@ class LambdaRanker:
                 "metric":                  self.cfg.metric,
                 "num_leaves":              self.cfg.num_leaves,
                 "learning_rate":           self.cfg.learning_rate,
-                "min_data_in_leaf":        5,
+                "min_data_in_leaf":        self.cfg.min_data_in_leaf,
                 "min_sum_hessian_in_leaf": 0,
                 "label_gain":              label_gain,
-                "feature_fraction":        0.8,
-                "bagging_fraction":        0.8,
-                "bagging_freq":            1,
-                "lambda_l2":               0.1,
+                "feature_fraction":        self.cfg.feature_fraction,
+                "bagging_fraction":        self.cfg.bagging_fraction,
+                "bagging_freq":            self.cfg.bagging_freq,
+                "lambda_l2":               self.cfg.lambda_l2,
                 "pos_bagging_fraction":    1.0,
-                "neg_bagging_fraction":    0.3,
+                "neg_bagging_fraction":    self.cfg.neg_bagging_fraction,
                 "verbose":                 -1,
             },
             train_set,
             valid_sets=[train_set, val_set],
             num_boost_round=self.cfg.num_boost_round,
-            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(50)],
+            callbacks=[lgb.early_stopping(self.cfg.early_stopping_rounds), lgb.log_evaluation(self.cfg.early_stopping_rounds)],
         )
         # Log training metrics
         train_scores = self.model.predict(X_train)
@@ -121,9 +121,8 @@ class LambdaRanker:
 
         if query_brand is not None:
             non_brand_mask = X[:, brand_col] == 0.0
-            # Demote non-brand matches unless score > 0.9 (keep strong semantic hits)
-            demote_mask = non_brand_mask & (scores < 0.9)
-            scores[demote_mask] *= 0.1
+            demote_mask = non_brand_mask & (scores < self.cfg.brand_demote_threshold)
+            scores[demote_mask] *= self.cfg.brand_demote_factor
 
         # ── Rule 2: Category Hierarchy Guardrail ─────────────────────
         primary_categories   = {"laptops", "phones", "electronics", "shoes", "clothing"}
@@ -151,7 +150,7 @@ class LambdaRanker:
                 # Cap accessory scores below the weakest primary
                 for i, idx in enumerate(top10_idx):
                     if top10_categories[i] in accessory_categories:
-                        scores[idx] = min(scores[idx], min_primary_score - 0.01)
+                        scores[idx] = min(scores[idx], min_primary_score - self.cfg.brand_demote_factor)
 
         return scores
     
