@@ -175,6 +175,16 @@ class FeatureEngineer:
         # ── Product embeddings ────────────────────────────────────────
         titles = [(p.get("title") or "") for p in products]
         n_candidates = len(products)
+        
+        # If products list is empty, infer count from pre-computed embeddings or indices
+        if n_candidates == 0:
+            if prod_embs is not None:
+                n_candidates = prod_embs.shape[0]
+            elif candidate_indices is not None:
+                n_candidates = len(candidate_indices)
+            elif bm25_scores is not None:
+                n_candidates = len(bm25_scores)
+
         if prod_embs is None:
             prod_embs = self.embedding_model.encode(titles)
 
@@ -190,8 +200,8 @@ class FeatureEngineer:
             else:
                 bm25_per_title = self.bm25.get_scores(query_tokens_list)[:n_candidates]
 
-        # Normalize BM25 scores (stable scaling to [0, ~1-2] range)
-        bm25_per_title = bm25_per_title / 10.0
+        # Normalize BM25 scores — factor configurable via RankerConfig.bm25_norm_factor
+        bm25_per_title = bm25_per_title / getattr(self, '_bm25_norm_factor', 10.0)
 
         # ── Cosine similarities ─────────────────────────────────────────
         semantic_sims      = cosine_similarity(query_emb, prod_embs)[0]
