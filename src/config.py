@@ -33,17 +33,21 @@ class DataConfig(BaseModel):
 
     # ── Retrieval settings ───────────────────────────────────────────────
     use_hybrid_retrieval:      bool  = True
-    retrieval_k:               int   = Field(50,  gt=0)
+    retrieval_k:               int   = Field(100, gt=0)
     rrf_k:                     int   = Field(60,  gt=0)
     semantic_weight:           float = Field(0.5, ge=0.0, le=1.0)
     bm25_weight:               float = Field(0.5, ge=0.0, le=1.0)
     seed:                      int   = 42
 
-    # ── Worker / candidate settings ──────────────────────────────────────
+# ── Worker / candidate settings ──────────────────────────────────────
     num_workers:               int   = Field(8,   gt=0)
     max_hard_negatives:        int   = Field(10,  gt=0)
     hard_neg_score_threshold:  float = Field(0.7, ge=0.0, le=1.0)
     semantic_score_threshold:  float = Field(0.8, ge=0.0, le=1.0)
+
+# ── Cross-encoder settings ─────────────────────────────────────────
+    use_cross_encoder_distillation: bool = False
+    use_cross_encoder:             bool = False
 
 
 class RankerConfig(BaseModel):
@@ -55,13 +59,14 @@ class RankerConfig(BaseModel):
     test_size:              float = Field(0.2,  gt=0.0, lt=1.0)
     seed:                   int   = 42
     # ── LightGBM regularization ──────────────────────────────────────────
-    min_data_in_leaf:       int   = Field(5,    gt=0)
+    min_data_in_leaf:       int   = Field(20,   gt=0)
     feature_fraction:       float = Field(0.8,  gt=0.0, le=1.0)
     bagging_fraction:       float = Field(0.8,  gt=0.0, le=1.0)
     bagging_freq:           int   = Field(1,    ge=0)
-    lambda_l2:              float = Field(0.1,  ge=0.0)
+    lambda_l2:              float = Field(1.0,  ge=0.0)
     neg_bagging_fraction:   float = Field(0.3,  gt=0.0, le=1.0)
     early_stopping_rounds:  int   = Field(50,   gt=0)
+    neg_downsample_ratio:   float = Field(3.0,  gt=0.0)  # keep at most 3x negatives per positive
     # ── Post-processing guardrails ───────────────────────────────────────
     brand_demote_threshold: float = Field(0.9,  ge=0.0, le=1.0)
     brand_demote_factor:    float = Field(0.1,  ge=0.0, le=1.0)
