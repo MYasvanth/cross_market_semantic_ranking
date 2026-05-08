@@ -44,17 +44,87 @@ def _mean_metrics(df: pd.DataFrame, score_col: str, groups: List[int]):
 
 
 def ablation_study(df: pd.DataFrame, groups: List[int]) -> pd.DataFrame:
-    """Per-query ablation: BM25 vs Semantic vs Full ranker."""
+    """Per-query ablation: BM25 vs Semantic vs Cross-Encoder vs Full ranker."""
     if len(df) == 0:
-        return pd.DataFrame({
-            "BM25":     {"ndcg": 0.62, "mrr": 0.45},
-            "Semantic": {"ndcg": 0.74, "mrr": 0.68},
-            "Full":     {"ndcg": 0.78, "mrr": 0.72},
-        }).T
+        raise ValueError(
+            "ablation_study called with empty DataFrame — no metrics to compute. "
+            "Check that feature extraction produced valid query groups."
+        )
 
     results = {
-        "BM25":     _mean_metrics(df, "bm25_score",    groups),
-        "Semantic": _mean_metrics(df, "semantic_sim",  groups),
-        "Full":     _mean_metrics(df, "ranker_score",  groups),
+        "BM25":     _mean_metrics(df, "bm25_score",   groups),
+        "Semantic": _mean_metrics(df, "semantic_sim", groups),
+        "Full":     _mean_metrics(df, "ranker_score", groups),
     }
+    if "ce_score" in df.columns and df["ce_score"].any():
+        results["CrossEncoder"] = _mean_metrics(df, "ce_score", groups)
     return pd.DataFrame(results).T
+
+
+def full_catalog_eval(
+    ranker,
+    val_df: pd.DataFrame,
+    products: pd.DataFrame,
+    product_embs: np.ndarray,
+    feat_eng,
+    vector_store,
+    top_k: int = 400,
+    sample_queries: int = 500,
+) -> dict:
+    """
+    Evaluate on the FULL catalog (not pre-filtered candidates).
+    top_k must match retrieval_k used during training so the eval candidate
+    pool is identical to the serving pool — otherwise NDCG is underestimated
+    because positives at ranks 201-400 are missed.
+    """
+    from src.features.feature_engineer import _detect_lang, _translate_query
+
+    rng        = np.random.default_rng(42)
+    val_qids   = val_df["qid"].unique()
+    if len(val_qids) > sample_queries:
+        val_qids = rng.choice(val_qids, size=sample_queries, replace=False)
+
+    pid_to_idx = {pid: idx for idx, pid in enumerate(products["pid"])}
+    ndcgs, mrrs = [], []
+
+    for qid in val_qids:
+        qgroup = val_df[val_df["qid"] == qid]
+        query  = qgroup["query"].iloc[0]
+
+        # Retrieve from full catalog
+        q_emb          = feat_eng.embedding_model.encode([query])
+        scores_arr, idx_arr = vector_store.search(q_emb, k=top_k)
+        cand_indices   = idx_arr[0].tolist()
+
+        if len(cand_indices) < 2:
+            continue
+
+        cand_embs = product_embs[cand_indices]
+        lang      = _detect_lang(query)
+        t_emb     = feat_eng.embedding_model.encode([_translate_query(query)]) if lang != "en" else q_emb
+
+        X_cand = feat_eng.extract_features(
+            query, [],
+            prod_embs=cand_embs, query_emb=q_emb,
+            translated_emb=t_emb, candidate_indices=cand_indices
+        )
+
+        ranker_scores = ranker.predict(X_cand)
+
+        labeled = qgroup.groupby("pid")["relevance"].max()
+        cand_pids = products["pid"].values[cand_indices]
+        y_true    = np.array([labeled.get(pid, 0) for pid in cand_pids])
+
+        if y_true.sum() == 0:
+            continue
+
+        ndcgs.append(compute_ndcg(y_true, ranker_scores))
+        mrrs.append(compute_mrr(y_true, ranker_scores))
+
+    result = {
+        "full_catalog_ndcg_10": float(np.mean(ndcgs)) if ndcgs else 0.0,
+        "full_catalog_mrr":     float(np.mean(mrrs))  if mrrs  else 0.0,
+        "n_queries_evaluated":  len(ndcgs),
+    }
+    log.info(f"Full-catalog eval ({len(ndcgs)} queries): NDCG@10={result['full_catalog_ndcg_10']:.4f}, MRR={result['full_catalog_mrr']:.4f}")
+    return result
