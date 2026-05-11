@@ -6,26 +6,24 @@ import logging
 
 log = logging.getLogger(__name__)
 
-# HNSW_M: number of graph connections per node — 32 is optimal recall/speed tradeoff
-_HNSW_M = 32
-
 
 class VectorStore:
     """FAISS index for Stage 1 retrieval — IndexHNSWFlat for ANN search."""
 
-    def __init__(self, dimension: int = 768, use_hnsw: bool = True):
+    def __init__(self, dimension: int = 768, use_hnsw: bool = True,
+                 hnsw_m: int = 32, ef_search: int = 64,
+                 max_vectors: int = 10_000_000, max_k: int = 1_000):
         self.dimension = dimension
+        self._MAX_VECTORS = max_vectors
+        self._MAX_K = max_k
         if use_hnsw:
-            self.index = faiss.IndexHNSWFlat(dimension, _HNSW_M)
-            self.index.hnsw.efSearch = 64   # search-time accuracy vs speed
-            log.info(f"FAISS IndexHNSWFlat(d={dimension}, M={_HNSW_M}, efSearch=64)")
+            self.index = faiss.IndexHNSWFlat(dimension, hnsw_m)
+            self.index.hnsw.efSearch = ef_search
+            log.info(f"FAISS IndexHNSWFlat(d={dimension}, M={hnsw_m}, efSearch={ef_search})")
         else:
             self.index = faiss.IndexFlatIP(dimension)
             log.info(f"FAISS IndexFlatIP(d={dimension})")
         self.ntotal = 0
-        
-    _MAX_VECTORS = 10_000_000
-    _MAX_K = 1_000
 
     def add(self, embeddings: np.ndarray, ids: List[int]):
         """Add product embeddings to index with validation."""
