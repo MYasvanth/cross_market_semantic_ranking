@@ -33,7 +33,7 @@ class EmbeddingModel:
         
     _MAX_TEXT_LEN = 512
 
-    def encode(self, texts: list[str], batch_size: int = 64, normalize: bool = True) -> np.ndarray:
+    def encode(self, texts: list[str], batch_size: int = 256, normalize: bool = True) -> np.ndarray:
         """Encode texts to embeddings with input validation."""
         if not texts:
             raise ValueError("texts must be a non-empty list")
@@ -45,7 +45,7 @@ class EmbeddingModel:
         embeddings = self.model.encode(
             sanitized,
             batch_size=batch_size,
-            show_progress_bar=False,
+            show_progress_bar=len(sanitized) > 1000,
             normalize_embeddings=normalize,
         )
         return embeddings
