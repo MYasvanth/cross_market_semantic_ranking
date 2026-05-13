@@ -7,7 +7,7 @@ import logging
 log = logging.getLogger(__name__)
 
 
-def export_ranker(model_path: str, output_path: str, num_features: int = 8):
+def export_ranker(model_path: str, output_path: str, num_features: int = 15):
     """
     Convert trained LightGBM booster to ONNX.
     Uses hummingbird-ml — no pkg_resources dependency.
