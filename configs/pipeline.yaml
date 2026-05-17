@@ -14,7 +14,7 @@ model:
   ranker:
     objective: lambdarank
     metric: ndcg
-    num_leaves: 63
+    num_leaves: 31
     learning_rate: 0.05
     num_boost_round: 500
   retrieval:
