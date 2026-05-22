@@ -16,6 +16,42 @@ ESCI_LABEL_MAP = {
     'E': 3,     'S': 2,         'C': 1,           'I': 0,          # legacy short-form
 }
 
+# Category keyword map for ESCI product inference
+_CATEGORY_KEYWORDS = {
+    "electronics":  ["laptop", "phone", "smartphone", "tablet", "camera", "headphone",
+                     "speaker", "tv", "television", "monitor", "keyboard", "mouse",
+                     "charger", "cable", "battery", "processor", "gpu", "ssd", "router"],
+    "clothing":     ["shirt", "pant", "dress", "jacket", "coat", "sweater", "hoodie",
+                     "jeans", "shorts", "skirt", "blouse", "suit", "underwear", "sock",
+                     "apparel", "wear", "fabric", "cotton", "polyester", "size"],
+    "shoes":        ["shoe", "sneaker", "boot", "sandal", "heel", "loafer", "slipper",
+                     "footwear", "running shoe", "athletic shoe", "sole", "insole"],
+    "home":         ["furniture", "chair", "table", "sofa", "bed", "mattress", "pillow",
+                     "curtain", "rug", "lamp", "shelf", "cabinet", "kitchen", "cookware",
+                     "pan", "pot", "utensil", "towel", "bedsheet", "blanket"],
+    "sports":       ["gym", "fitness", "yoga", "dumbbell", "weight", "treadmill",
+                     "bicycle", "bike", "helmet", "glove", "ball", "racket", "sport"],
+    "books":        ["book", "novel", "textbook", "paperback", "hardcover", "author",
+                     "edition", "chapter", "isbn"],
+    "toys":         ["toy", "game", "puzzle", "lego", "doll", "action figure", "board game",
+                     "kids", "children", "play"],
+    "beauty":       ["shampoo", "conditioner", "moisturizer", "serum", "lipstick",
+                     "foundation", "mascara", "perfume", "skincare", "haircare", "lotion"],
+    "grocery":      ["food", "snack", "drink", "beverage", "coffee", "tea", "protein",
+                     "supplement", "vitamin", "organic", "gluten"],
+}
+
+
+def _infer_esci_category(text: str) -> str:
+    """Infer product category from title + bullet text using keyword matching."""
+    best_cat, best_count = "other", 0
+    for cat, keywords in _CATEGORY_KEYWORDS.items():
+        count = sum(1 for kw in keywords if kw in text)
+        if count > best_count:
+            best_count = count
+            best_cat = cat
+    return best_cat
+
 
 class DataGenerator:
     """
@@ -43,15 +79,15 @@ class DataGenerator:
         if self.use_augmentation:
             from src.data.synthetic_augmentor import SyntheticAugmentor
             self.augmentor = SyntheticAugmentor(
-                api_key=config.get('grok_api_key'),
-                api_endpoint=config.get('grok_api_endpoint'),
                 cache_path=config.get('augmentation_cache_path', 'artifacts/synthetic_cache.pkl'),
                 use_llm=config.get('use_llm', False),
+                use_llm_titles=config.get('use_llm_titles', True),
+                use_llm_queries=config.get('use_llm_queries', False),
                 queries_per_product=config.get('queries_per_product', 50),
                 hard_negative_ratio=config.get('hard_negative_ratio', 0.15),
                 attribute_noise_ratio=config.get('attribute_noise_ratio', 0.20),
                 synonym_injection_ratio=config.get('synonym_injection_ratio', 0.30),
-                llm_model_name=config.get('llm_model_name', 'grok-2-latest'),
+                llm_model_name=config.get('llm_model_name', 'llama-3.1-8b-instant'),
                 seed=config.get('seed', 42),
             )
             log.info("Synthetic augmentation enabled via SyntheticAugmentor")
@@ -76,8 +112,15 @@ class DataGenerator:
                 first_row_logged = True
             if max_rows and total >= max_rows:
                 break
-            raw_label = row.get('esci_label')
-            relevance = ESCI_LABEL_MAP.get(raw_label, 0)
+            raw_label = row.get('esci_label') or row.get('label')
+            relevance = ESCI_LABEL_MAP.get(raw_label, -1)
+            if relevance == -1:
+                continue  # skip rows with unmappable labels instead of silently treating as irrelevant
+            # Infer real category from product_title + bullet points
+            title_text = (row.get('product_title') or '').lower()
+            bullet_text = (row.get('product_bullet_point') or '').lower()
+            combined = title_text + ' ' + bullet_text
+            inferred_category = _infer_esci_category(combined)
             batch.append({
                 'qid':           str(row['query_id']),
                 'pid':           str(row['product_id']),
@@ -85,7 +128,7 @@ class DataGenerator:
                 'query_lang':    row.get('product_locale') or 'en',
                 'product_title': row.get('product_title') or '',
                 'brand':         row.get('product_brand') or '',
-                'category':      row.get('product_locale') or '',
+                'category':      inferred_category,
                 'relevance':     relevance
             })
             total += 1
@@ -119,18 +162,21 @@ class DataGenerator:
             yield from self._generate_legacy_stream(num_products, queries_per)
 
     def _generate_augmented_stream(self, num_products: int, queries_per: int) -> Generator[Dict, None, None]:
-        """Augmented synthetic stream with LLM/fallback-generated realistic data."""
+        """Augmented synthetic stream with cross-product hard negatives."""
         products = self.augmentor.generate_catalog(
             n=num_products,
             categories=self.categories,
             brands=self.brands,
         )
 
+        # Build category index for cross-product hard negatives
+        cat_index: Dict[str, list] = {}
         for prod in products:
-            # Positive queries
+            cat_index.setdefault(prod.category, []).append(prod)
+
+        for prod in products:
             queries = self.augmentor.generate_queries(prod, n=queries_per)
             for q in queries:
-                # Use synonym-aware relevance assignment from augmentor
                 relevance = self.augmentor.assign_relevance(q['text'], prod)
                 yield {
                     'qid':                 f"synth_q{prod.product_id}_{hash(q['text']) & 0xFFFFFF:06x}",
@@ -145,22 +191,25 @@ class DataGenerator:
                     'intent':              q.get('intent', 'generic'),
                 }
 
-            # Hard negatives (confusing near-misses)
-            for q in queries[:max(1, int(queries_per * 0.3))]:
-                hard_negs = self.augmentor.generate_hard_negatives(prod, q)
-                for neg in hard_negs:
-                    yield {
-                        'qid':                 f"synth_q{prod.product_id}_hn_{hash(neg['text']) & 0xFFFFFF:06x}",
-                        'pid':                 f"synth_p{prod.product_id}",
-                        'query':               neg['text'],
-                        'query_lang':          neg.get('lang', 'en'),
-                        'product_title':       prod.title_en,
-                        'product_title_local': prod.title_local.get(neg.get('lang', 'en'), ''),
-                        'brand':               prod.brand,
-                        'category':            prod.category,
-                        'relevance':           0,  # Hard negatives are explicitly irrelevant
-                        'intent':              neg.get('intent', 'hard_negative'),
-                    }
+            # Cross-product hard negatives: pair this product's queries with
+            # similar-category products — semantically close but wrong product
+            same_cat = [p for p in cat_index.get(prod.category, []) if p.product_id != prod.product_id]
+            n_cross = max(1, int(queries_per * self.augmentor.hard_negative_ratio))
+            cross_targets = self.augmentor.rng.sample(same_cat, min(n_cross, len(same_cat)))
+            anchor_queries = [q for q in queries if q.get('intent') in ('brand', 'sku')][:n_cross]
+            for q, neg_prod in zip(anchor_queries, cross_targets):
+                yield {
+                    'qid':                 f"synth_q{prod.product_id}_{hash(q['text']) & 0xFFFFFF:06x}",
+                    'pid':                 f"synth_p{neg_prod.product_id}",
+                    'query':               q['text'],
+                    'query_lang':          q.get('lang', 'en'),
+                    'product_title':       neg_prod.title_en,
+                    'product_title_local': neg_prod.title_local.get('en', ''),
+                    'brand':               neg_prod.brand,
+                    'category':            neg_prod.category,
+                    'relevance':           0,  # wrong product = irrelevant
+                    'intent':              'hard_negative_cross_product',
+                }
 
     def _generate_legacy_stream(self, num_products: int, queries_per: int) -> Generator[Dict, None, None]:
         """Original static template-based synthetic stream (fallback)."""
@@ -246,9 +295,9 @@ class DataGenerator:
     # ── Legacy Helpers ────────────────────────────────────────────────────
 
     def _generate_products(self, n: int) -> pd.DataFrame:
-        np.random.seed(42)
-        cats   = np.random.choice(self.categories, n)
-        brands = np.random.choice(self.brands, n)
+        rng    = np.random.default_rng(42)
+        cats   = rng.choice(self.categories, n)
+        brands = rng.choice(self.brands, n)
         return pd.DataFrame({
             'product_id':  range(n),
             'title_en':    [f"{brands[i]} {cats[i].title()}" for i in range(n)],
