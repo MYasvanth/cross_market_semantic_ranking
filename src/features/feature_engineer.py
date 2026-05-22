@@ -5,6 +5,8 @@ from rank_bm25 import BM25Okapi
 from sklearn.metrics.pairwise import cosine_similarity
 from langdetect import detect, LangDetectException
 from src.embeddings.embedding_model import EmbeddingModel
+# Single canonical tokenizer shared with retriever — eliminates IDF skew
+from src.retrieval.retriever import _normalize_tokens as _bm25_tokenize
 
 # Cross-lingual query translation map (local -> English keywords)
 # Covers the 4 target markets: India (hi), Egypt (ar), Poland (pl)
@@ -43,7 +45,10 @@ def _detect_lang(query: str) -> str:
 
 
 def _tokenize(text: str) -> list[str]:
-    """Basic preprocessing for lexical features."""
+    """Basic whitespace tokenizer for token-set features (coverage, prefix, Jaccard).
+    Intentionally different from _bm25_tokenize: these features measure surface
+    overlap between raw query tokens and raw title tokens, not BM25 relevance.
+    """
     return text.lower().split()
 
 
@@ -70,34 +75,56 @@ def classify_intent(query: str) -> str:
 
 class FeatureEngineer:
     """
-    Extracts 14 universal signals per query-product pair.
+    Extracts 14 universal signals per query-product pair (or 15 with cross-encoder).
 
     Pre-computes catalog-level data (normalized brands, categories, title tokens)
     to avoid redundant work across 50k+ queries.
     """
 
     FEATURE_NAMES = [
-        "semantic_sim",
-        "cross_lingual_sim",
-        "bm25_score",
-        "jaccard",
-        "brand_match",
-        "category_match",
-        "exact_title_match",
-        "query_len",
-        "intent_brand_weight",
-        "intent_sku_weight",
-        "intent_generic_weight",
-        "semantic_channel",
-        "lexical_channel",
-        "constraint_channel",
+        "semantic_sim",         # col 0  — cosine sim query vs product
+        "cross_lingual_sim",    # col 1  — cosine sim translated query vs product
+        "bm25_score",           # col 2  — BM25 normalized score
+        "brand_match",          # col 3  — query contains product brand
+        "category_match",       # col 4  — query contains product category
+        "query_len",            # col 5  — number of query tokens
+        "lexical_channel",      # col 6  — avg(bm25, token_coverage)
+        "title_len_ratio",      # col 7  — title tokens / query tokens
+        "prefix_match",         # col 8  — query tokens in title prefix
+        "token_coverage",       # col 9  — query tokens found in title
+        "semantic_rank",        # col 10 — log-rank: 1/(log1p(rank)+1), flatter than 1/(rank+1)
+        "bm25_rank",            # col 11 — log-rank: 1/(log1p(rank)+1), flatter than 1/(rank+1)
+        "title_brand_in_query", # col 12 — title word found in query
+        # cols 13-14 only present when use_cross_encoder=True
+        "ce_score",             # col 13 — cross-encoder sigmoid score
+        "ce_evaluated",         # col 14 — 1 if CE was run on this candidate
     ]
 
-    def __init__(self, embedding_model: EmbeddingModel, bm25_tokenized_docs: list):
+    def __init__(
+        self,
+        embedding_model: EmbeddingModel,
+        bm25_tokenized_docs: list,
+        use_cross_encoder: bool = False,
+        cross_encoder_model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+        ce_top_k: int = 50,
+    ):
         self.embedding_model = embedding_model
-        self.bm25 = BM25Okapi(bm25_tokenized_docs)
-        # Pre-compute catalog data for vectorized feature extraction
+        # Use canonical _bm25_tokenize (stopword-stripped) so IDF weights match
+        # the retriever's BM25 index — eliminates train/serve tokenizer skew.
+        normalized_docs = [_bm25_tokenize(" ".join(doc)) for doc in bm25_tokenized_docs]
+        self.bm25 = BM25Okapi(normalized_docs)
+        self.use_cross_encoder = use_cross_encoder
+        self._ce_model_name = cross_encoder_model_name
+        self._ce_top_k = ce_top_k
+        self._ce_model = None
         self._catalog_precomputed = False
+
+    def _load_cross_encoder(self):
+        """Lazily load cross-encoder model on first use."""
+        if self._ce_model is None:
+            from sentence_transformers import CrossEncoder
+            self._ce_model = CrossEncoder(self._ce_model_name)
+        return self._ce_model
 
     def precompute_catalog(self, products_df: pd.DataFrame):
         """
@@ -143,6 +170,8 @@ class FeatureEngineer:
         translated_emb: np.ndarray = None,
         candidate_indices: list = None,
         bm25_scores: np.ndarray = None,
+        retrieval_ranks: np.ndarray = None,  # rank position from semantic retrieval
+        bm25_ranks: np.ndarray = None,       # rank position from BM25
     ) -> np.ndarray:
         """
         Extract 14 features for every (query, product) pair.
@@ -188,34 +217,53 @@ class FeatureEngineer:
         if prod_embs is None:
             prod_embs = self.embedding_model.encode(titles)
 
-        # ── BM25: score only the k candidates using global IDF ──────────────
+        # ── BM25: score candidates using canonical tokenizer ──────────────────────
+        # bm25_scores takes priority (pre-computed in main process for training).
+        # Falls back to live scoring only at inference time (full_catalog_eval).
+        # Both paths use _bm25_tokenize for consistent IDF weights.
         if bm25_scores is not None:
-            bm25_per_title = bm25_scores
+            bm25_per_title = np.asarray(bm25_scores, dtype=np.float32)
         else:
-            query_tokens_list = _tokenize(query)
+            if self.bm25 is None:
+                raise RuntimeError(
+                    "bm25_scores must be provided when FeatureEngineer.bm25 is None. "
+                    "Pass pre-computed scores from the main process."
+                )
+            q_tokens = _bm25_tokenize(query)
             if candidate_indices is not None:
                 bm25_per_title = np.array(
-                    self.bm25.get_batch_scores(query_tokens_list, candidate_indices)
+                    self.bm25.get_batch_scores(q_tokens, candidate_indices), dtype=np.float32
                 )
             else:
-                bm25_per_title = self.bm25.get_scores(query_tokens_list)[:n_candidates]
+                bm25_per_title = np.array(
+                    self.bm25.get_scores(q_tokens)[:n_candidates], dtype=np.float32
+                )
 
         # Normalize BM25 scores — factor configurable via RankerConfig.bm25_norm_factor
         bm25_per_title = bm25_per_title / getattr(self, '_bm25_norm_factor', 10.0)
 
         # ── Cosine similarities ─────────────────────────────────────────
-        semantic_sims      = cosine_similarity(query_emb, prod_embs)[0]
+        # Keep float32 throughout — sklearn cosine_similarity upcasts to float64
+        # internally, doubling per-worker memory. Explicit float32 cast prevents this.
+        semantic_sims      = cosine_similarity(
+            query_emb.astype(np.float32), prod_embs.astype(np.float32)
+        )[0].astype(np.float32)
         cross_lingual_sims = (
-            cosine_similarity(translated_emb, prod_embs)[0]
+            cosine_similarity(
+                translated_emb.astype(np.float32), prod_embs.astype(np.float32)
+            )[0].astype(np.float32)
             if is_non_english else semantic_sims
         )
 
-        # ── Vectorized entity + lexical features ────────────────────────
+        # ── Vectorized entity + lexical features ────────────────────────────────
         from src.data.normalizer import normalize_entity, normalize_query
         norm_query = normalize_query(query_lower)
 
         if self._catalog_precomputed and candidate_indices is not None:
-            # Fast path: use pre-computed catalog data with fully vectorized ops
+            # Fast path: use pre-computed catalog data with fully vectorized ops.
+            # brand_norm and category_norm come from product titles/metadata only —
+            # never from training labels — so these features are leakage-free at
+            # both train and inference time.
             cand_brands = self._brands_norm[candidate_indices]
             cand_cats   = self._categories_norm[candidate_indices]
             cand_titles = self._titles_lower[candidate_indices]
@@ -229,62 +277,120 @@ class FeatureEngineer:
                 (1.0 if c and c in norm_query else 0.0 for c in cand_cats),
                 dtype=np.float32, count=n_candidates
             )
-            exact_match = np.fromiter(
-                (1.0 if norm_query in t else 0.0 for t in cand_titles),
-                dtype=np.float32, count=n_candidates
-            )
-
-            # Vectorized Jaccard via pre-computed token sets
-            query_len_f = float(len(query_tokens))
-            cand_token_sets = self._title_tokens[candidate_indices]
-            unions = np.fromiter(
-                (len(query_tokens | ts) for ts in cand_token_sets),
-                dtype=np.float32, count=n_candidates
-            )
-            intersect = np.fromiter(
-                (len(query_tokens & ts) for ts in cand_token_sets),
-                dtype=np.float32, count=n_candidates
-            )
-            jaccard = np.where(unions > 0, intersect / unions, 0.0).astype(np.float32)
         else:
             # Fallback: compute per-product (slower, for backward compat)
             brands = np.array([normalize_entity((p.get("brand")    or "").lower(), 'brand')    for p in products])
             categories = np.array([normalize_entity((p.get("category") or "").lower(), 'category') for p in products])
             titles_lower = np.array([t.lower() for t in titles])
 
-            brand_match = np.array([1.0 if b and b in norm_query else 0.0 for b in brands],     dtype=np.float32)
-            category_match = np.array([1.0 if c and c in norm_query else 0.0 for c in categories], dtype=np.float32)
-            exact_match = np.array([1.0 if norm_query in t else 0.0 for t in titles_lower],      dtype=np.float32)
+            brand_match    = np.array([1.0 if b and b in norm_query else 0.0 for b in brands],      dtype=np.float32)
+            category_match = np.array([1.0 if c and c in norm_query else 0.0 for c in categories],  dtype=np.float32)
 
-            title_token_sets = [set(t.split()) for t in titles_lower]
-            unions   = np.array([len(query_tokens | ts) for ts in title_token_sets], dtype=np.float32)
-            intersect = np.array([len(query_tokens & ts) for ts in title_token_sets], dtype=np.float32)
-            jaccard  = np.where(unions > 0, intersect / unions, 0.0).astype(np.float32)
+        if self._catalog_precomputed and candidate_indices is not None:
+            title_brand_in_query = np.fromiter(
+                (1.0 if any(w in norm_query for w in t.split() if len(w) > 3) else 0.0
+                 for t in self._titles_lower[candidate_indices]),
+                dtype=np.float32, count=n_candidates
+            )
+        else:
+            title_brand_in_query = np.fromiter(
+                (1.0 if any(w in norm_query for w in t.lower().split() if len(w) > 3) else 0.0
+                 for t in titles),
+                dtype=np.float32, count=n_candidates
+            )
+        # ── Cross-encoder
+        # ce_score=0 is ambiguous: it could mean "irrelevant" or "not evaluated".
+        # ce_evaluated=1 breaks that ambiguity so LambdaMART can learn separate
+        # decision boundaries for scored vs unscored candidates.
+        if self.use_cross_encoder:
+            ce_model = self._load_cross_encoder()
+            if candidate_indices is not None and self._catalog_precomputed:
+                all_titles_ce = self._titles_lower[candidate_indices].tolist()
+            else:
+                all_titles_ce = titles
 
-        # ── Intent weights ─────────────────────────────────────────────
-        intent = classify_intent(query)
-        intent_brand  = 1.0 if intent == "BRAND"  else 0.0
-        intent_sku    = 1.0 if intent == "SKU"    else 0.0
-        intent_generic = 1.0 if intent == "GENERIC" else 0.0
+            top_k = min(getattr(self, '_ce_top_k', 50), n_candidates)
+            top_k_idx = np.argpartition(-semantic_sims, top_k - 1)[:top_k]
 
-        # ── Three-Channel Aggregates ───────────────────────────────────
-        semantic_channel   = (semantic_sims + cross_lingual_sims) / 2.0
-        lexical_channel    = (bm25_per_title + jaccard + exact_match) / 3.0
-        constraint_channel = (brand_match + category_match + np.full(n_candidates, intent_brand, dtype=np.float32)) / 3.0
+            ce_pairs = [(query, all_titles_ce[i]) for i in top_k_idx]
+            ce_scores_raw = ce_model.predict(ce_pairs, batch_size=64).astype(np.float32)
+            ce_scores_sigmoid = (1.0 / (1.0 + np.exp(-ce_scores_raw))).astype(np.float32)
 
-        return np.column_stack([
+            ce_scores     = np.zeros(n_candidates, dtype=np.float32)
+            ce_evaluated  = np.zeros(n_candidates, dtype=np.float32)
+            ce_scores[top_k_idx]    = ce_scores_sigmoid
+            ce_evaluated[top_k_idx] = 1.0
+        else:
+            ce_scores    = np.zeros(n_candidates, dtype=np.float32)
+            ce_evaluated = np.zeros(n_candidates, dtype=np.float32)
+
+        features = [
             semantic_sims.astype(np.float32),
             cross_lingual_sims.astype(np.float32),
             bm25_per_title.astype(np.float32),
-            jaccard,
             brand_match,
             category_match,
-            exact_match,
             np.full(n_candidates, query_len, dtype=np.float32),
-            np.full(n_candidates, intent_brand,  dtype=np.float32),
-            np.full(n_candidates, intent_sku,    dtype=np.float32),
-            np.full(n_candidates, intent_generic, dtype=np.float32),
-            semantic_channel.astype(np.float32),
-            lexical_channel.astype(np.float32),
-            constraint_channel.astype(np.float32),
-        ])
+        ]
+
+        # ── Title-level features (3 new signals) ──────────────────────────
+        if self._catalog_precomputed and candidate_indices is not None:
+            t_lens = np.array([len(ts) for ts in self._title_tokens[candidate_indices]], dtype=np.float32)
+        else:
+            t_lens = np.array([len(set(t.split())) for t in titles], dtype=np.float32)
+
+        query_len_f = float(max(query_len, 1))
+        # title_len_ratio: how much longer is the title vs query (penalizes very long titles)
+        title_len_ratio = np.clip(t_lens / query_len_f, 0.0, 10.0).astype(np.float32)
+
+        # prefix_match: fraction of query tokens that appear in title prefix (first 5 tokens)
+        if self._catalog_precomputed and candidate_indices is not None:
+            prefix_sets = [set(t.split()[:5]) for t in self._titles_lower[candidate_indices]]
+        else:
+            prefix_sets = [set(t.lower().split()[:5]) for t in titles]
+        prefix_match = np.array(
+            [len(query_tokens & ps) / query_len_f for ps in prefix_sets], dtype=np.float32
+        )
+
+        # token_coverage: fraction of query tokens covered by title tokens
+        if self._catalog_precomputed and candidate_indices is not None:
+            cand_sets = self._title_tokens[candidate_indices]
+        else:
+            cand_sets = [set(t.lower().split()) for t in titles]
+        token_coverage = np.array(
+            [len(query_tokens & ts) / query_len_f for ts in cand_sets], dtype=np.float32
+        )
+
+        # lexical_channel: bm25 + token_coverage (computed here after token_coverage is ready)
+        lexical_channel = (bm25_per_title + token_coverage) / 2.0
+
+        features += [lexical_channel.astype(np.float32), title_len_ratio, prefix_match, token_coverage]
+
+        # ── Rank position features — log-rank transform ──────────────────
+        # log1p compresses the top-rank advantage: rank=0->1.0, rank=9->0.41,
+        # rank=99->0.20, rank=399->0.16. Much flatter than 1/(rank+1), forcing
+        # the model to rely on semantic/lexical features to break ties instead
+        # of memorizing retrieval order from training queries.
+        if retrieval_ranks is not None:
+            sem_rank_feat = 1.0 / (np.log1p(retrieval_ranks.astype(np.float32)) + 1.0)
+        else:
+            order = np.argsort(-semantic_sims)
+            ranks = np.empty_like(order)
+            ranks[order] = np.arange(len(order))
+            sem_rank_feat = 1.0 / (np.log1p(ranks.astype(np.float32)) + 1.0)
+
+        if bm25_ranks is not None:
+            bm25_rank_feat = 1.0 / (np.log1p(bm25_ranks.astype(np.float32)) + 1.0)
+        else:
+            order = np.argsort(-bm25_per_title)
+            ranks = np.empty_like(order)
+            ranks[order] = np.arange(len(order))
+            bm25_rank_feat = 1.0 / (np.log1p(ranks.astype(np.float32)) + 1.0)
+
+        features += [sem_rank_feat, bm25_rank_feat, title_brand_in_query]
+        # Only append CE features when cross-encoder is actually enabled (Root Cause 4 fix).
+        # Dead zero columns add noise and consume feature slots without contributing signal.
+        if self.use_cross_encoder:
+            features.append(ce_scores)
+            features.append(ce_evaluated)
+        return np.column_stack(features)
