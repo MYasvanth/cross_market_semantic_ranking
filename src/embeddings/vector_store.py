@@ -78,6 +78,14 @@ class VectorStore:
         return store
     
     def normalize_index(self):
-        """Normalize for cosine similarity."""
+        """Normalize vectors for cosine similarity — only valid for IndexFlatL2.
+        IndexHNSWFlat does not support in-place normalization; call this only
+        when use_hnsw=False, or normalize embeddings before calling add().
+        """
+        if hasattr(self.index, 'hnsw'):
+            raise TypeError(
+                "normalize_index() is not supported for IndexHNSWFlat. "
+                "Normalize embeddings before calling add() instead."
+            )
         faiss.normalize_L2(self.index)
 
