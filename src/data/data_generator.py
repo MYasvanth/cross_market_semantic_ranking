@@ -233,23 +233,27 @@ class DataGenerator:
     @staticmethod
     def _rule_based_relevance(query: str, prod) -> int:
         """Assign relevance purely from text rules — no embeddings, no leakage."""
+        import re
         from src.data.normalizer import normalize_entity, normalize_query
         if 'irrelevant' in query.lower() or 'hard_negative' in query.lower():
             return 0
         q = normalize_query(query)
 
-        # Handle both AugmentedProduct (dataclass) and pd.Series (dict-like)
         if hasattr(prod, 'brand'):
-            # AugmentedProduct or object with attributes
-            brand = normalize_entity(getattr(prod, 'brand', ''), 'brand')
+            brand    = normalize_entity(getattr(prod, 'brand', ''), 'brand')
             category = normalize_entity(getattr(prod, 'category', ''), 'category')
         else:
-            # pd.Series or dict
-            brand = normalize_entity(prod.get('brand', ''), 'brand')
+            brand    = normalize_entity(prod.get('brand', ''), 'brand')
             category = normalize_entity(prod.get('category', ''), 'category')
 
-        brand_match    = brand in q
-        category_match = category in q
+        # Word-boundary match prevents "lg" matching "algorithm", etc.
+        def _word_match(term: str, text: str) -> bool:
+            if not term:
+                return False
+            return bool(re.search(r'\b' + re.escape(term) + r'\b', text))
+
+        brand_match    = _word_match(brand, q)
+        category_match = _word_match(category, q)
         if brand_match and category_match:
             return 3   # Exact
         if brand_match or category_match:
