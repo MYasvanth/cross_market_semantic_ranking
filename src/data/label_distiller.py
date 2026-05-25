@@ -111,6 +111,12 @@ class LabelDistiller:
             q_min, q_max = q_scores.min(), q_scores.max()
             if q_max > q_min:
                 normalized[mask] = scale * (q_scores - q_min) / (q_max - q_min)
+            elif mask.sum() == 1:
+                # Single-product group: preserve the original ordinal label
+                # rather than assigning an arbitrary midpoint.
+                # Caller keeps integer label for this row unchanged.
+                normalized[mask] = q_scores[0]
             else:
+                # All scores identical in a multi-product group — assign midpoint.
                 normalized[mask] = scale / 2.0
         return normalized
