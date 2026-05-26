@@ -107,17 +107,38 @@ class FeatureEngineer:
         use_cross_encoder: bool = False,
         cross_encoder_model_name: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
         ce_top_k: int = 50,
+        bm25_norm_factor: float = 10.0,
     ):
         self.embedding_model = embedding_model
-        # Use canonical _bm25_tokenize (stopword-stripped) so IDF weights match
-        # the retriever's BM25 index — eliminates train/serve tokenizer skew.
         normalized_docs = [_bm25_tokenize(" ".join(doc)) for doc in bm25_tokenized_docs]
         self.bm25 = BM25Okapi(normalized_docs)
         self.use_cross_encoder = use_cross_encoder
         self._ce_model_name = cross_encoder_model_name
         self._ce_top_k = ce_top_k
+        self._bm25_norm_factor = bm25_norm_factor  # explicit param, not a hidden side-effect
         self._ce_model = None
         self._catalog_precomputed = False
+
+    def _get_catalog_slice(self, candidate_indices, titles):
+        """Return (brands, categories, titles_lower, title_token_sets) for candidates.
+        Uses pre-computed catalog arrays when available, falls back to per-call compute.
+        Centralises the fast-path/fallback branching that was duplicated 5x in extract_features.
+        """
+        from src.data.normalizer import normalize_entity
+        if self._catalog_precomputed and candidate_indices is not None:
+            return (
+                self._brands_norm[candidate_indices],
+                self._categories_norm[candidate_indices],
+                self._titles_lower[candidate_indices],
+                self._title_tokens[candidate_indices],
+            )
+        titles_lower = np.array([t.lower() for t in titles])
+        brands       = np.array([normalize_entity((t or "").lower(), 'brand')    for t in titles_lower])
+        categories   = np.array([normalize_entity((t or "").lower(), 'category') for t in titles_lower])
+        token_sets   = np.empty(len(titles), dtype=object)
+        for i, t in enumerate(titles_lower):
+            token_sets[i] = set(t.split())
+        return brands, categories, titles_lower, token_sets
 
     def _load_cross_encoder(self):
         """Lazily load cross-encoder model on first use."""
@@ -204,8 +225,7 @@ class FeatureEngineer:
         # ── Product embeddings ────────────────────────────────────────
         titles = [(p.get("title") or "") for p in products]
         n_candidates = len(products)
-        
-        # If products list is empty, infer count from pre-computed embeddings or indices
+
         if n_candidates == 0:
             if prod_embs is not None:
                 n_candidates = prod_embs.shape[0]
@@ -217,17 +237,13 @@ class FeatureEngineer:
         if prod_embs is None:
             prod_embs = self.embedding_model.encode(titles)
 
-        # ── BM25: score candidates using canonical tokenizer ──────────────────────
-        # bm25_scores takes priority (pre-computed in main process for training).
-        # Falls back to live scoring only at inference time (full_catalog_eval).
-        # Both paths use _bm25_tokenize for consistent IDF weights.
+        # ── BM25 ──────────────────────────────────────────────────────────────
         if bm25_scores is not None:
             bm25_per_title = np.asarray(bm25_scores, dtype=np.float32)
         else:
             if self.bm25 is None:
                 raise RuntimeError(
-                    "bm25_scores must be provided when FeatureEngineer.bm25 is None. "
-                    "Pass pre-computed scores from the main process."
+                    "bm25_scores must be provided when FeatureEngineer.bm25 is None."
                 )
             q_tokens = _bm25_tokenize(query)
             if candidate_indices is not None:
@@ -239,13 +255,10 @@ class FeatureEngineer:
                     self.bm25.get_scores(q_tokens)[:n_candidates], dtype=np.float32
                 )
 
-        # Normalize BM25 scores — factor configurable via RankerConfig.bm25_norm_factor
-        bm25_per_title = bm25_per_title / getattr(self, '_bm25_norm_factor', 10.0)
+        bm25_per_title = bm25_per_title / self._bm25_norm_factor
 
-        # ── Cosine similarities ─────────────────────────────────────────
-        # Keep float32 throughout — sklearn cosine_similarity upcasts to float64
-        # internally, doubling per-worker memory. Explicit float32 cast prevents this.
-        semantic_sims      = cosine_similarity(
+        # ── Cosine similarities ───────────────────────────────────────────────
+        semantic_sims = cosine_similarity(
             query_emb.astype(np.float32), prod_embs.astype(np.float32)
         )[0].astype(np.float32)
         cross_lingual_sims = (
@@ -255,49 +268,26 @@ class FeatureEngineer:
             if is_non_english else semantic_sims
         )
 
-        # ── Vectorized entity + lexical features ────────────────────────────────
-        from src.data.normalizer import normalize_entity, normalize_query
+        # ── Entity + lexical features (single catalog slice call) ─────────────
+        from src.data.normalizer import normalize_query
         norm_query = normalize_query(query_lower)
 
-        if self._catalog_precomputed and candidate_indices is not None:
-            # Fast path: use pre-computed catalog data with fully vectorized ops.
-            # brand_norm and category_norm come from product titles/metadata only —
-            # never from training labels — so these features are leakage-free at
-            # both train and inference time.
-            cand_brands = self._brands_norm[candidate_indices]
-            cand_cats   = self._categories_norm[candidate_indices]
-            cand_titles = self._titles_lower[candidate_indices]
+        cand_brands, cand_cats, cand_titles_lower, cand_token_sets = \
+            self._get_catalog_slice(candidate_indices, titles)
 
-            # Fully vectorized brand/category/exact match via NumPy broadcasting
-            brand_match = np.fromiter(
-                (1.0 if b and b in norm_query else 0.0 for b in cand_brands),
-                dtype=np.float32, count=n_candidates
-            )
-            category_match = np.fromiter(
-                (1.0 if c and c in norm_query else 0.0 for c in cand_cats),
-                dtype=np.float32, count=n_candidates
-            )
-        else:
-            # Fallback: compute per-product (slower, for backward compat)
-            brands = np.array([normalize_entity((p.get("brand")    or "").lower(), 'brand')    for p in products])
-            categories = np.array([normalize_entity((p.get("category") or "").lower(), 'category') for p in products])
-            titles_lower = np.array([t.lower() for t in titles])
-
-            brand_match    = np.array([1.0 if b and b in norm_query else 0.0 for b in brands],      dtype=np.float32)
-            category_match = np.array([1.0 if c and c in norm_query else 0.0 for c in categories],  dtype=np.float32)
-
-        if self._catalog_precomputed and candidate_indices is not None:
-            title_brand_in_query = np.fromiter(
-                (1.0 if any(w in norm_query for w in t.split() if len(w) > 3) else 0.0
-                 for t in self._titles_lower[candidate_indices]),
-                dtype=np.float32, count=n_candidates
-            )
-        else:
-            title_brand_in_query = np.fromiter(
-                (1.0 if any(w in norm_query for w in t.lower().split() if len(w) > 3) else 0.0
-                 for t in titles),
-                dtype=np.float32, count=n_candidates
-            )
+        brand_match = np.fromiter(
+            (1.0 if b and b in norm_query else 0.0 for b in cand_brands),
+            dtype=np.float32, count=n_candidates
+        )
+        category_match = np.fromiter(
+            (1.0 if c and c in norm_query else 0.0 for c in cand_cats),
+            dtype=np.float32, count=n_candidates
+        )
+        title_brand_in_query = np.fromiter(
+            (1.0 if any(w in norm_query for w in t.split() if len(w) > 3) else 0.0
+             for t in cand_titles_lower),
+            dtype=np.float32, count=n_candidates
+        )
         # ── Cross-encoder
         # ce_score=0 is ambiguous: it could mean "irrelevant" or "not evaluated".
         # ce_evaluated=1 breaks that ambiguity so LambdaMART can learn separate
@@ -333,32 +323,19 @@ class FeatureEngineer:
             np.full(n_candidates, query_len, dtype=np.float32),
         ]
 
-        # ── Title-level features (3 new signals) ──────────────────────────
-        if self._catalog_precomputed and candidate_indices is not None:
-            t_lens = np.array([len(ts) for ts in self._title_tokens[candidate_indices]], dtype=np.float32)
-        else:
-            t_lens = np.array([len(set(t.split())) for t in titles], dtype=np.float32)
+        # ── Title-level features ──────────────────────────────────────────────
+        t_lens = np.array([len(ts) for ts in cand_token_sets], dtype=np.float32)
 
-        query_len_f = float(max(query_len, 1))
-        # title_len_ratio: how much longer is the title vs query (penalizes very long titles)
+        query_len_f     = float(max(query_len, 1))
         title_len_ratio = np.clip(t_lens / query_len_f, 0.0, 10.0).astype(np.float32)
 
-        # prefix_match: fraction of query tokens that appear in title prefix (first 5 tokens)
-        if self._catalog_precomputed and candidate_indices is not None:
-            prefix_sets = [set(t.split()[:5]) for t in self._titles_lower[candidate_indices]]
-        else:
-            prefix_sets = [set(t.lower().split()[:5]) for t in titles]
+        prefix_sets  = [set(t.split()[:5]) for t in cand_titles_lower]
         prefix_match = np.array(
             [len(query_tokens & ps) / query_len_f for ps in prefix_sets], dtype=np.float32
         )
 
-        # token_coverage: fraction of query tokens covered by title tokens
-        if self._catalog_precomputed and candidate_indices is not None:
-            cand_sets = self._title_tokens[candidate_indices]
-        else:
-            cand_sets = [set(t.lower().split()) for t in titles]
         token_coverage = np.array(
-            [len(query_tokens & ts) / query_len_f for ts in cand_sets], dtype=np.float32
+            [len(query_tokens & ts) / query_len_f for ts in cand_token_sets], dtype=np.float32
         )
 
         # lexical_channel: bm25 + token_coverage (computed here after token_coverage is ready)
