@@ -233,43 +233,47 @@ class LambdaRanker:
         log.info(f"Training Metrics:\n{train_metrics.to_string()}")
 
         # -- Overfitting diagnostics -------------------------------------------
+        self._log_overfitting_diagnostics(evals_result, self.model.best_iteration)
+
+        return X_val, y_val, group_val
+
+    def _log_overfitting_diagnostics(
+        self, evals_result: dict, best_iter: int
+    ) -> None:
+        """Log train/val NDCG gap and per-round table. Extracted from fit() for readability."""
         train_ndcg = (evals_result.get("training", {}).get("ndcg@5", []) or
                       evals_result.get("training", {}).get("ndcg@1", []))
         val_ndcg   = (evals_result.get("valid_1",  {}).get("ndcg@5", []) or
                       evals_result.get("valid_1",  {}).get("ndcg@1", []))
 
-        if train_ndcg and val_ndcg:
-            best_iter   = self.model.best_iteration
-            # best_iteration is 1-based; clamp to valid list range in case
-            # early stopping never fired (best_iteration == num_boost_round
-            # equals len(list), which would be an off-by-one IndexError).
-            best_idx    = min(best_iter - 1, len(train_ndcg) - 1)
-            final_train = train_ndcg[best_idx]
-            final_val   = val_ndcg[best_idx]
-            gap         = final_train - final_val
-            peak_val    = max(val_ndcg)
-            peak_iter   = val_ndcg.index(peak_val) + 1
+        if not (train_ndcg and val_ndcg):
+            return
 
-            log.info("-- Overfitting Diagnostics --")
-            log.info(f"  Best iteration : {best_iter}")
-            log.info(f"  Train NDCG@5   : {final_train:.4f}")
-            log.info(f"  Val   NDCG@5   : {final_val:.4f}")
-            log.info(f"  Train/Val gap  : {gap:.4f}")
-            log.info(f"  Peak val NDCG@5: {peak_val:.4f} @ iter {peak_iter}")
+        best_idx    = min(best_iter - 1, len(train_ndcg) - 1)
+        final_train = train_ndcg[best_idx]
+        final_val   = val_ndcg[best_idx]
+        gap         = final_train - final_val
+        peak_val    = max(val_ndcg)
+        peak_iter   = val_ndcg.index(peak_val) + 1
 
-            if gap > 0.05:
-                log.warning(f"  OVERFIT DETECTED: gap={gap:.4f} > 0.05 threshold.")
-            elif gap > 0.02:
-                log.warning(f"  MILD OVERFIT: gap={gap:.4f}. Monitor on next run.")
-            else:
-                log.info(f"  Generalisation OK: gap={gap:.4f} <= 0.02")
+        log.info("-- Overfitting Diagnostics --")
+        log.info(f"  Best iteration : {best_iter}")
+        log.info(f"  Train NDCG@5   : {final_train:.4f}")
+        log.info(f"  Val   NDCG@5   : {final_val:.4f}")
+        log.info(f"  Train/Val gap  : {gap:.4f}")
+        log.info(f"  Peak val NDCG@5: {peak_val:.4f} @ iter {peak_iter}")
 
-            log.info("  Round | Train NDCG@5 | Val NDCG@5 | Gap")
-            for i in range(0, len(train_ndcg), 50):
-                log.info(f"  {i+1:5d} | {train_ndcg[i]:.4f}       | "
-                         f"{val_ndcg[i]:.4f}     | {train_ndcg[i]-val_ndcg[i]:.4f}")
+        if gap > 0.05:
+            log.warning(f"  OVERFIT DETECTED: gap={gap:.4f} > 0.05 threshold.")
+        elif gap > 0.02:
+            log.warning(f"  MILD OVERFIT: gap={gap:.4f}. Monitor on next run.")
+        else:
+            log.info(f"  Generalisation OK: gap={gap:.4f} <= 0.02")
 
-        return X_val, y_val, group_val
+        log.info("  Round | Train NDCG@5 | Val NDCG@5 | Gap")
+        for i in range(0, len(train_ndcg), 50):
+            log.info(f"  {i+1:5d} | {train_ndcg[i]:.4f}       | "
+                     f"{val_ndcg[i]:.4f}     | {train_ndcg[i]-val_ndcg[i]:.4f}")
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict ranking scores."""
