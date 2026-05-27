@@ -7,28 +7,44 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 _MODEL_CACHE = {}
+_MODEL_CACHE_LOCK = None  # lazy init — avoids import-time threading overhead
+
+
+def _get_cache_lock():
+    global _MODEL_CACHE_LOCK
+    if _MODEL_CACHE_LOCK is None:
+        import threading
+        _MODEL_CACHE_LOCK = threading.Lock()
+    return _MODEL_CACHE_LOCK
+
 
 class EmbeddingModel:
     """Multilingual E5-base for semantic similarity."""
-    
+
     MODEL_NAME = "intfloat/multilingual-e5-base"
-    
-    def __new__(cls, model_name: Optional[str] = None, device: str = "cpu"):
+
+    def __new__(cls, model_name: Optional[str] = None, device: Optional[str] = None):
         import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model_name = model_name or cls.MODEL_NAME
-        cache_key = (model_name, device)
-        if cache_key not in _MODEL_CACHE:
-            instance = super(EmbeddingModel, cls).__new__(cls)
-            _MODEL_CACHE[cache_key] = instance
+        resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        resolved_name   = model_name or cls.MODEL_NAME
+        cache_key = (resolved_name, resolved_device)
+        with _get_cache_lock():
+            if cache_key not in _MODEL_CACHE:
+                instance = super().__new__(cls)
+                # Store resolved values so __init__ uses the same ones
+                instance._resolved_name   = resolved_name
+                instance._resolved_device = resolved_device
+                _MODEL_CACHE[cache_key] = instance
         return _MODEL_CACHE[cache_key]
-    
-    def __init__(self, model_name: Optional[str] = None, device: str = "cpu"):
+
+    def __init__(self, model_name: Optional[str] = None, device: Optional[str] = None):
         if hasattr(self, 'model'):
             return
-        model_name = model_name or self.MODEL_NAME
+        # Use values resolved in __new__ — never re-resolve here to stay consistent
+        model_name = self._resolved_name
+        device     = self._resolved_device
         log.info(f"Loading {model_name} on {device}")
-        self.model = SentenceTransformer(model_name)
+        self.model  = SentenceTransformer(model_name)
         self.device = device
         
     _MAX_TEXT_LEN = 512
