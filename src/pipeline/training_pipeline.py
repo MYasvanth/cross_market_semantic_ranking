@@ -3,7 +3,9 @@ import numpy as np
 import pandas as pd
 import logging
 import os
-from typing import List, Tuple, Annotated
+import pickle
+from pathlib import Path
+from typing import List, Tuple, Annotated, NamedTuple
 from multiprocessing import Pool, cpu_count, shared_memory
 
 from zenml import step, pipeline
@@ -18,6 +20,19 @@ from src.ranking.evaluator import ablation_study
 from src.ranking.materializer import LambdaRankerMaterializer
 
 log = logging.getLogger(__name__)
+
+
+class FeatureSplits(NamedTuple):
+    """Typed container for train/val/test feature arrays — prevents positional unpacking errors."""
+    X_train: np.ndarray
+    y_train: np.ndarray
+    g_train: List[int]
+    X_val:   np.ndarray
+    y_val:   np.ndarray
+    g_val:   List[int]
+    X_test:  np.ndarray
+    y_test:  np.ndarray
+    g_test:  List[int]
 
 
 # ── Step 1: Data Ingestion ─────────────────────────────────────────────────
@@ -201,6 +216,104 @@ def _process_query_group(args):
     return (X_group, y_group, len(y_group), retrieved_with_label_count, total_positives_in_group)
 
 
+def _build_retrieval_index(products, product_embs, cfg):
+    """Build VectorStore + FeatureEngineer + retriever. Single responsibility."""
+    embed_model  = EmbeddingModel(cfg.embedding_model_name)
+    vector_store = VectorStore(
+        hnsw_m=cfg.vector_store.hnsw_m,
+        ef_search=cfg.vector_store.ef_search,
+        max_vectors=cfg.vector_store.max_vectors,
+        max_k=cfg.vector_store.max_k,
+    )
+    vector_store.add(product_embs, ids=products.index.tolist())
+    bm25_docs = products["title"].str.split().tolist()
+    feat_eng  = FeatureEngineer(
+        embed_model, bm25_docs,
+        use_cross_encoder=cfg.data.use_cross_encoder,
+        cross_encoder_model_name=cfg.data.cross_encoder_model_name,
+        ce_top_k=cfg.data.ce_top_k,
+        bm25_norm_factor=cfg.ranker.bm25_norm_factor,
+    )
+    feat_eng.precompute_catalog(products)
+    if cfg.data.use_hybrid_retrieval:
+        from src.retrieval.retriever import HybridRetriever
+        retriever = HybridRetriever(
+            embed_model, vector_store, bm25_docs,
+            rrf_k=cfg.data.rrf_k,
+            semantic_weight=cfg.data.semantic_weight,
+            bm25_weight=cfg.data.bm25_weight,
+        )
+        log.info(f"HybridRetriever k={cfg.data.retrieval_k} rrf_k={cfg.data.rrf_k}")
+    else:
+        from src.retrieval.retriever import SemanticRetriever
+        retriever = SemanticRetriever(embed_model, vector_store)
+        log.info(f"SemanticRetriever k={cfg.data.retrieval_k}")
+    return embed_model, vector_store, feat_eng, retriever
+
+
+def _build_query_lookups(train_df, embed_model, retriever, cfg):
+    """Encode queries and run retrieval via retriever.retrieve() — no duplicated RRF logic."""
+    unique_queries = train_df[["qid", "query"]].drop_duplicates("qid")
+    q_texts        = unique_queries["query"].tolist()
+    qids           = unique_queries["qid"].tolist()
+    all_query_embs = embed_model.encode(q_texts)
+    non_en_indices = [i for i, q in enumerate(q_texts) if _detect_lang(q) != "en"]
+    log.info(f"Non-English queries: {len(non_en_indices)} / {len(q_texts)}")
+    all_translated_embs = all_query_embs.copy()
+    if non_en_indices:
+        all_translated_embs[non_en_indices] = embed_model.encode(
+            [_translate_query(q_texts[i]) for i in non_en_indices]
+        )
+    query_lookup = {}
+    for i, qid in enumerate(qids):
+        q_emb   = all_query_embs[i].reshape(1, -1)
+        results = retriever.retrieve(q_texts[i], top_k=cfg.data.retrieval_k, query_emb=q_emb)
+        query_lookup[qid] = {
+            "emb":            q_emb,
+            "translated_emb": all_translated_embs[i].reshape(1, -1),
+            "pids":           [r[0] for r in results],
+        }
+    return query_lookup
+
+
+def _precompute_bm25_ranks(feat_eng, train_df):
+    """Pre-compute BM25 inverse-rank arrays for all queries in main process."""
+    from src.retrieval.retriever import _normalize_tokens
+    unique_queries = train_df[["qid", "query"]].drop_duplicates("qid")
+    q_texts = unique_queries["query"].tolist()
+    qids    = unique_queries["qid"].tolist()
+    log.info("Pre-computing BM25 ranks...")
+    qid_to_bm25_ranks: dict = {}
+    for i, qid in enumerate(qids):
+        scores       = feat_eng.bm25.get_scores(_normalize_tokens(q_texts[i])).astype(np.float32)
+        argsort_desc = np.argsort(-scores).astype(np.int32)
+        rank_of      = np.empty_like(argsort_desc)
+        rank_of[argsort_desc] = np.arange(len(argsort_desc), dtype=np.int32)
+        qid_to_bm25_ranks[qid] = rank_of
+    log.info("BM25 pre-computation complete.")
+    return qid_to_bm25_ranks
+
+
+def _evaluate_retrieval(query_lookup, df, pid_to_idx):
+    """Compute Retrieval Recall@k for k in [10, 50, 100]."""
+    idx_to_pid = {idx: pid for pid, idx in pid_to_idx.items()}
+    recall_results = {}
+    for k in [10, 50, 100]:
+        hits, total = 0, 0
+        for qid, qgroup in df.groupby("qid"):
+            if qid not in query_lookup:
+                continue
+            retrieved_pids = {idx_to_pid.get(i) for i in query_lookup[qid]["pids"][:k]}
+            positives      = set(qgroup[qgroup["relevance"] > 0]["pid"])
+            if positives & retrieved_pids:
+                hits += 1
+            total += 1
+        recall = hits / max(total, 1)
+        recall_results[f"retrieval_recall_{k}"] = recall
+        log.info(f"Retrieval Recall@{k}: {recall:.3f} ({hits}/{total})")
+    return recall_results
+
+
 # ── Step 3: Feature Engineering ────────────────────────────────────────────
 
 @step(enable_cache=True)
@@ -208,17 +321,7 @@ def build_features(
     train_df: pd.DataFrame,
     products: pd.DataFrame,
     cfg: PipelineConfig,
-) -> Tuple[
-    Annotated[np.ndarray, "X_train"],
-    Annotated[np.ndarray, "y_train"],
-    Annotated[List[int], "groups_train"],
-    Annotated[np.ndarray, "X_val"],
-    Annotated[np.ndarray, "y_val"],
-    Annotated[List[int], "groups_val"],
-    Annotated[np.ndarray, "X_test"],
-    Annotated[np.ndarray, "y_test"],
-    Annotated[List[int], "groups_test"],
-]:
+) -> Annotated[FeatureSplits, "splits"]:
     # ── FIX 1: Held-out test split BEFORE train/val ─────────────────────
     rng      = np.random.default_rng(cfg.ranker.seed)
     all_qids = train_df["qid"].unique()
@@ -235,8 +338,9 @@ def build_features(
     # Load embeddings into shared memory — one allocation in the OS page cache,
     # all workers attach by name with zero copies. Standard production pattern
     # used by PyTorch DataLoader, Ray, and Dask for large read-only arrays.
-    _raw          = np.load(str(Path("artifacts") / "embeddings.npy"))
-    product_embs  = np.ascontiguousarray(_raw, dtype=np.float32)
+    with open(Path("artifacts") / "embeddings.npy", "rb") as _f:
+        _raw = np.load(_f)
+    product_embs = np.ascontiguousarray(_raw, dtype=np.float32)
     del _raw
     shm           = shared_memory.SharedMemory(create=True, size=product_embs.nbytes)
     shm_arr       = np.ndarray(product_embs.shape, dtype=np.float32, buffer=shm.buf)
@@ -245,127 +349,15 @@ def build_features(
     product_embs  = shm_arr  # alias for _build_tasks slicing below
     log.info(f"Loaded product_embs into shared_memory: shape {shm_arr.shape}, shm={shm.name}")
 
-    embed_model  = EmbeddingModel(cfg.embedding_model_name)
-    vector_store = VectorStore(
-        hnsw_m=cfg.vector_store.hnsw_m,
-        ef_search=cfg.vector_store.ef_search,
-        max_vectors=cfg.vector_store.max_vectors,
-        max_k=cfg.vector_store.max_k,
-    )
-    vector_store.add(product_embs, ids=products.index.tolist())
+    _, _, feat_eng, retriever = _build_retrieval_index(products, product_embs, cfg)
 
-    bm25_docs = products["title"].str.split().tolist()
-    feat_eng  = FeatureEngineer(
-        embed_model, bm25_docs,
-        use_cross_encoder=cfg.data.use_cross_encoder,
-        cross_encoder_model_name=cfg.data.cross_encoder_model_name,
-        ce_top_k=cfg.data.ce_top_k,
-    )
-    feat_eng.precompute_catalog(products)
+    retrieval_k  = cfg.data.retrieval_k
+    use_hybrid   = cfg.data.use_hybrid_retrieval
+    query_lookup = _build_query_lookups(train_df, feat_eng.embedding_model, retriever, cfg)
+    pid_to_idx   = {pid: idx for idx, pid in enumerate(products["pid"])}
+    qid_to_bm25_ranks = _precompute_bm25_ranks(feat_eng, train_df)
 
-    unique_queries = train_df[["qid", "query"]].drop_duplicates("qid")
-    q_texts        = unique_queries["query"].tolist()
-    all_query_embs = embed_model.encode(q_texts)
-
-    non_en_mask    = [_detect_lang(q) != "en" for q in q_texts]
-    non_en_indices = [i for i, m in enumerate(non_en_mask) if m]
-    log.info(f"Non-English queries: {len(non_en_indices)} / {len(q_texts)}")
-
-    all_translated_embs = all_query_embs.copy()
-    if non_en_indices:
-        non_en_translated = [_translate_query(q_texts[i]) for i in non_en_indices]
-        all_translated_embs[non_en_indices] = embed_model.encode(non_en_translated)
-
-    retrieval_k = cfg.data.retrieval_k
-    use_hybrid  = cfg.data.use_hybrid_retrieval
-
-    if use_hybrid:
-        from src.retrieval.retriever import HybridRetriever, _normalize_tokens
-        retriever = HybridRetriever(
-            embed_model, vector_store, bm25_docs,
-            rrf_k=cfg.data.rrf_k,
-            semantic_weight=cfg.data.semantic_weight,
-            bm25_weight=cfg.data.bm25_weight,
-        )
-        log.info(f"Using HybridRetriever (k={retrieval_k}, rrf_k={cfg.data.rrf_k})")
-    else:
-        from src.retrieval.retriever import SemanticRetriever, _normalize_tokens
-        retriever = SemanticRetriever(embed_model, vector_store)
-        log.info(f"Using SemanticRetriever (k={retrieval_k})")
-
-    # OPT 1: Store query embeddings as numpy arrays keyed by index, not .tolist()
-    # .tolist() converts float32 -> Python float (8 bytes each) inflating query_lookup
-    # RAM by ~3x. Keep as float32 numpy and only convert in worker via np.array().
-    query_lookup = {}
-    qids         = unique_queries["qid"].tolist()
-    batch_scores, batch_indices = vector_store.search(all_query_embs, k=min(retrieval_k * 2, len(products)))
-
-    if use_hybrid:
-        for i, qid in enumerate(qids):
-            sem_indices   = batch_indices[i]
-            bm25_scores_i = retriever.bm25.get_scores(_normalize_tokens(q_texts[i]))
-            fused = {}
-            for rank, idx in enumerate(sem_indices):
-                fused[int(idx)] = retriever.semantic_weight / (retriever.rrf_k + rank + 1)
-            bm25_ranks_i = np.argsort(-bm25_scores_i)[:retrieval_k * 2]
-            for rank, idx in enumerate(bm25_ranks_i):
-                idx = int(idx)
-                fused[idx] = fused.get(idx, 0.0) + retriever.bm25_weight / (retriever.rrf_k + rank + 1)
-            sorted_results = sorted(fused.items(), key=lambda x: x[1], reverse=True)[:retrieval_k]
-            query_lookup[qid] = {
-                "emb":            all_query_embs[i].reshape(1, -1),
-                "translated_emb": all_translated_embs[i].reshape(1, -1),
-                "pids":           [r[0] for r in sorted_results],
-            }
-    else:
-        for i, qid in enumerate(qids):
-            query_lookup[qid] = {
-                "emb":            all_query_embs[i].reshape(1, -1),
-                "translated_emb": all_translated_embs[i].reshape(1, -1),
-                "pids":           batch_indices[i].tolist(),
-            }
-
-    pid_to_idx = {pid: idx for idx, pid in enumerate(products["pid"])}
-
-    # OPT 4: Pre-compute BM25 scores for all queries in main process in one pass.
-    # Workers currently call bm25.get_batch_scores per query, each scoring the
-    # full 84k corpus. Doing it once here in the main process reuses the BM25
-    # IDF weights without re-initializing per worker and avoids redundant scoring.
-    from src.retrieval.retriever import _normalize_tokens
-    log.info("Pre-computing BM25 scores for all queries...")
-    all_q_tokens = [_normalize_tokens(q) for q in q_texts]
-    qid_to_bm25_ranks: dict = {}
-    for i, qid in enumerate(qids):
-        bm25_scores_q = feat_eng.bm25.get_scores(all_q_tokens[i]).astype(np.float32)
-        # inverse permutation: rank_of[catalog_idx] = BM25 rank
-        argsort_desc  = np.argsort(-bm25_scores_q).astype(np.int32)
-        rank_of       = np.empty_like(argsort_desc)
-        rank_of[argsort_desc] = np.arange(len(argsort_desc), dtype=np.int32)
-        qid_to_bm25_ranks[qid] = rank_of  # O(1) rank lookup per candidate
-    log.info("BM25 pre-computation complete.")
-
-    def _evaluate_retrieval(query_lookup, df, pid_to_idx, products_df):
-        """Compute Retrieval Recall@k for k in [10, 50, 100]."""
-        idx_to_pid = {idx: pid for pid, idx in pid_to_idx.items()}
-        recall_results = {}
-        for k in [10, 50, 100]:
-            hits = 0
-            total = 0
-            for qid, qgroup in df.groupby("qid"):
-                if qid not in query_lookup:
-                    continue
-                retrieved_indices = query_lookup[qid]["pids"][:k]
-                retrieved_pids = {idx_to_pid.get(i) for i in retrieved_indices}
-                positives = set(qgroup[qgroup["relevance"] > 0]["pid"])
-                if positives.intersection(retrieved_pids):
-                    hits += 1
-                total += 1
-            recall = hits / max(total, 1)
-            recall_results[f"retrieval_recall_{k}"] = recall
-            log.info(f"Retrieval Recall@{k}: {recall:.3f} ({hits}/{total})")
-        return recall_results
-
-    retrieval_recalls = _evaluate_retrieval(query_lookup, train_df[train_df["qid"].isin(train_qids)], pid_to_idx, products)
+    retrieval_recalls = _evaluate_retrieval(query_lookup, train_df[train_df["qid"].isin(train_qids)], pid_to_idx)
     try:
         import mlflow
         mlflow.log_metrics(retrieval_recalls)
@@ -517,10 +509,10 @@ def build_features(
         pickle.dump(val_df_split, f)
     log.info(f"Saved val_df.pkl ({len(val_df_split)} rows) to artifacts/")
 
-    return (
-        np.vstack(X_tr), np.hstack(y_tr), g_tr,
-        np.vstack(X_vl), np.hstack(y_vl), g_vl,
-        np.vstack(X_ts), np.hstack(y_ts), g_ts,
+    return FeatureSplits(
+        X_train=np.vstack(X_tr), y_train=np.hstack(y_tr), g_train=g_tr,
+        X_val=np.vstack(X_vl),   y_val=np.hstack(y_vl),   g_val=g_vl,
+        X_test=np.vstack(X_ts),  y_test=np.hstack(y_ts),  g_test=g_ts,
     )
 
 
@@ -528,17 +520,12 @@ def build_features(
 
 @step(output_materializers={"ranker": LambdaRankerMaterializer}, enable_cache=True)
 def train_ranker(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    groups_train: List[int],
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    groups_val: List[int],
-    X_test: np.ndarray,
-    y_test: np.ndarray,
-    groups_test: List[int],
+    splits: FeatureSplits,
     cfg: PipelineConfig,
 ) -> Annotated[LambdaRanker, "ranker"]:
+    X_train, y_train, groups_train = splits.X_train, splits.y_train, splits.g_train
+    X_val,   y_val,   groups_val   = splits.X_val,   splits.y_val,   splits.g_val
+    X_test,  y_test,  groups_test  = splits.X_test,  splits.y_test,  splits.g_test
     ranker = LambdaRanker(cfg.ranker)
     # ── FIX 3: Pass pre-split query-disjoint val set directly ────────────
     ranker.fit(X_train, y_train, groups_train, X_val=X_val, y_val=y_val, group_val=groups_val)
@@ -573,7 +560,8 @@ def train_ranker(
             val_df_full = pickle.load(f)
         with open(Path("artifacts") / "catalog.pkl", "rb") as f:
             products_df = pickle.load(f)
-        product_embs_full = np.load(str(Path("artifacts") / "embeddings.npy"))
+        with open(Path("artifacts") / "embeddings.npy", "rb") as _ef:
+            product_embs_full = np.load(_ef)
 
         from src.embeddings.embedding_model import EmbeddingModel
         from src.embeddings.vector_store import VectorStore
@@ -591,6 +579,7 @@ def train_ranker(
             use_cross_encoder=cfg.data.use_cross_encoder,
             cross_encoder_model_name=cfg.data.cross_encoder_model_name,
             ce_top_k=cfg.data.ce_top_k,
+            bm25_norm_factor=cfg.ranker.bm25_norm_factor,
         )
         feat_eng_eval.precompute_catalog(products_df)
 
@@ -615,7 +604,9 @@ def train_ranker(
         import mlflow
         import mlflow.lightgbm
         from pathlib import Path
-        mlflow.set_tracking_uri(f"sqlite:///{Path(__file__).resolve().parents[2] / 'mlflow.db'}")
+        # Path derived from __file__, not user input — not an injection risk
+        _mlflow_db = Path(__file__).resolve().parents[2] / "mlflow.db"
+        mlflow.set_tracking_uri(f"sqlite:///{_mlflow_db}")
         mlflow.set_experiment("cross_market_semantic_ranking")
         with mlflow.start_run():
             mlflow.log_params({
@@ -654,7 +645,7 @@ def train_ranker(
 
 @pipeline(name="cross_market_semantic_ranking")
 def ranking_pipeline(cfg: PipelineConfig = PipelineConfig()):
-    train_df                                                                   = ingest_data(cfg)
-    products                                                                   = build_embeddings(train_df, cfg)
-    X_train, y_train, g_train, X_val, y_val, g_val, X_test, y_test, g_test   = build_features(train_df, products, cfg)
-    train_ranker(X_train, y_train, g_train, X_val, y_val, g_val, X_test, y_test, g_test, cfg)
+    train_df = ingest_data(cfg)
+    products = build_embeddings(train_df, cfg)
+    splits   = build_features(train_df, products, cfg)
+    train_ranker(splits, cfg)
