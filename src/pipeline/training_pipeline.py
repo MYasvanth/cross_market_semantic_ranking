@@ -276,20 +276,24 @@ def _build_query_lookups(train_df, embed_model, retriever, cfg):
     return query_lookup
 
 
-def _precompute_bm25_ranks(feat_eng, train_df):
-    """Pre-compute BM25 inverse-rank arrays for all queries in main process."""
+def _precompute_bm25_ranks(feat_eng, train_df, query_lookup, pid_to_idx, retrieval_k):
+    """Pre-compute BM25 ranks as sparse {catalog_idx: rank} dicts — one per query.
+    Stores only the top-(retrieval_k*2) BM25 results instead of the full 84k float64
+    array, reducing memory from ~17 GB to ~200 MB for 50k queries.
+    """
     from src.retrieval.retriever import _normalize_tokens
     unique_queries = train_df[["qid", "query"]].drop_duplicates("qid")
     q_texts = unique_queries["query"].tolist()
     qids    = unique_queries["qid"].tolist()
     log.info("Pre-computing BM25 ranks...")
+    top_n = retrieval_k * 2
     qid_to_bm25_ranks: dict = {}
     for i, qid in enumerate(qids):
-        scores       = feat_eng.bm25.get_scores(_normalize_tokens(q_texts[i])).astype(np.float32)
-        argsort_desc = np.argsort(-scores).astype(np.int32)
-        rank_of      = np.empty_like(argsort_desc)
-        rank_of[argsort_desc] = np.arange(len(argsort_desc), dtype=np.int32)
-        qid_to_bm25_ranks[qid] = rank_of
+        scores       = feat_eng.bm25.get_scores(_normalize_tokens(q_texts[i]))
+        top_indices  = np.argpartition(-scores, min(top_n, len(scores) - 1))[:top_n]
+        top_indices  = top_indices[np.argsort(-scores[top_indices])]
+        # sparse dict: only store ranks for top-N docs
+        qid_to_bm25_ranks[qid] = {int(idx): rank for rank, idx in enumerate(top_indices)}
     log.info("BM25 pre-computation complete.")
     return qid_to_bm25_ranks
 
@@ -355,7 +359,7 @@ def build_features(
     use_hybrid   = cfg.data.use_hybrid_retrieval
     query_lookup = _build_query_lookups(train_df, feat_eng.embedding_model, retriever, cfg)
     pid_to_idx   = {pid: idx for idx, pid in enumerate(products["pid"])}
-    qid_to_bm25_ranks = _precompute_bm25_ranks(feat_eng, train_df)
+    qid_to_bm25_ranks = _precompute_bm25_ranks(feat_eng, train_df, query_lookup, pid_to_idx, cfg.data.retrieval_k)
 
     retrieval_recalls = _evaluate_retrieval(query_lookup, train_df[train_df["qid"].isin(train_qids)], pid_to_idx)
     try:
@@ -430,10 +434,9 @@ def build_features(
             candidate_indices = candidate_indices[:retrieval_k]
             ret_ranks = [retrieval_rank_map.get(i, retrieval_k) for i in candidate_indices]
 
-            # OPT 5: O(k) rank lookup using pre-computed inverse permutation.
-            # rank_of[catalog_idx] = BM25 rank, so indexing is direct array access.
-            rank_of = qid_to_bm25_ranks[qid]
-            bm25_ranks_cand = rank_of[candidate_indices].tolist()
+            # Sparse dict lookup — missing entries default to retrieval_k (unranked)
+            bm25_rank_dict  = qid_to_bm25_ranks[qid]
+            bm25_ranks_cand = [bm25_rank_dict.get(i, retrieval_k) for i in candidate_indices]
 
             task_lookup = {
                 "emb":               qlookup["emb"],
